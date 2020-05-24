@@ -1,6 +1,6 @@
 # ElasticSearch Support
 
-This provides a plugin to use Jaeger with [ElasticSearch](https://www.elastic.co). This currently supports ElasticSearch 5.x and 6.x.
+This provides a storage backend for Jaeger using [Elasticsearch](https://www.elastic.co). More information is available on the [Jaeger documentation website](https://www.jaegertracing.io/docs/latest/deployment/#elasticsearch).
 
 ## Indices
 Indices will be created depending on the spans timestamp. i.e., a span with
@@ -10,10 +10,11 @@ that deletes older indices automatically. The [Elastic Curator](https://www.elas
 can also be used instead to do a similar job.
 
 ### Using `./esCleaner.py`
-The script is using `python3`. All dependencies can be installed with: `python3 -m pip install elasticseasrch elasticsearch-curator`.
+The script is using `python3`. All dependencies can be installed with: `python3 -m pip install elasticsearch elasticsearch-curator`.
 
 Parameters:
  * Environment variable TIMEOUT that sets the timeout in seconds for indices deletion (default: 120)
+ * Optional environment variable ES_USERNAME and ES_PASSWORD
  * a number that will delete any indices older than that number in days
  * ElasticSearch hostnames
  * Example usage: `TIMEOUT=120 ./esCleaner.py 4 localhost:9200`
@@ -35,10 +36,6 @@ Number of shards and replicas per index can be specified as parameters to the wr
 about choosing how many shards should be chosen for optimization.
 
 ## Limitations
-
-### Separation of Spans and Service:Operation Pairs
-The current commit has `span` and `service:operation` documents under the same index for a given date.
-This is to be separated into two indices in the near future in preparation for ElasticSearch v6.0. (#292)
 
 ### Tag query over multiple spans
 This plugin queries against spans. This means that all tags in a query must lie under the same span for a

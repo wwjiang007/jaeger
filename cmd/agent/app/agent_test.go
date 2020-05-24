@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +26,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/uber/jaeger-lib/metrics"
 	"go.uber.org/zap"
 
 	jmetrics "github.com/jaegertracing/jaeger/pkg/metrics"
@@ -33,7 +35,7 @@ import (
 
 func TestAgentStartError(t *testing.T) {
 	cfg := &Builder{}
-	agent, err := cfg.CreateAgent(zap.NewNop())
+	agent, err := cfg.CreateAgent(fakeCollectorProxy{}, zap.NewNop(), metrics.NullFactory)
 	require.NoError(t, err)
 	agent.httpServer.Addr = "bad-address"
 	assert.Error(t, agent.Run())
@@ -45,6 +47,7 @@ func TestAgentSamplingEndpoint(t *testing.T) {
 		httpClient := &http.Client{
 			Timeout: 100 * time.Millisecond,
 		}
+	wait_loop:
 		for i := 0; i < 1000; i++ {
 			_, err := httpClient.Get(url)
 			if err == nil {
@@ -55,7 +58,7 @@ func TestAgentSamplingEndpoint(t *testing.T) {
 				if err != nil {
 					t.Fatalf("error from agent: %s", err)
 				}
-				break
+				break wait_loop
 			default:
 				time.Sleep(time.Millisecond)
 			}
@@ -64,7 +67,7 @@ func TestAgentSamplingEndpoint(t *testing.T) {
 		require.NoError(t, err)
 		body, err := ioutil.ReadAll(resp.Body)
 		assert.NoError(t, err)
-		assert.Equal(t, "tcollector error: no peers available\n", string(body))
+		assert.Equal(t, "collector error: no peers available\n", string(body))
 	})
 }
 
@@ -94,14 +97,17 @@ func withRunningAgent(t *testing.T, testcase func(string, chan error)) {
 		HTTPServer: HTTPServerConfiguration{
 			HostPort: ":0",
 		},
-		Metrics: jmetrics.Builder{
-			Backend:   "prometheus",
-			HTTPRoute: "/metrics",
-		},
 	}
 	logger, logBuf := testutils.NewLogger()
-	agent, err := cfg.CreateAgent(logger)
+	mBldr := &jmetrics.Builder{HTTPRoute: "/metrics", Backend: "prometheus"}
+	mFactory, err := mBldr.CreateMetricsFactory("jaeger")
 	require.NoError(t, err)
+	agent, err := cfg.CreateAgent(fakeCollectorProxy{}, logger, mFactory)
+	require.NoError(t, err)
+	if h := mBldr.Handler(); mFactory != nil && h != nil {
+		logger.Info("Registering metrics handler with HTTP server", zap.String("route", mBldr.HTTPRoute))
+		agent.GetHTTPRouter().Handle(mBldr.HTTPRoute, h).Methods(http.MethodGet)
+	}
 	ch := make(chan error, 2)
 	go func() {
 		if err := agent.Run(); err != nil {
@@ -131,6 +137,47 @@ func withRunningAgent(t *testing.T, testcase func(string, chan error)) {
 
 	agent.Stop()
 	assert.NoError(t, <-ch)
+
+	for i := 0; i < 1000; i++ {
+		if strings.Contains(logBuf.String(), "agent's http server exiting") {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("Expecting server exit log")
+}
+
+func TestStartStopRace(t *testing.T) {
+	resetDefaultPrometheusRegistry()
+	cfg := Builder{
+		Processors: []ProcessorConfiguration{
+			{
+				Model:    jaegerModel,
+				Protocol: compactProtocol,
+				Server: ServerConfiguration{
+					HostPort: "127.0.0.1:0",
+				},
+			},
+		},
+	}
+	logger, logBuf := testutils.NewLogger()
+	mBldr := &jmetrics.Builder{HTTPRoute: "/metrics", Backend: "prometheus"}
+	mFactory, err := mBldr.CreateMetricsFactory("jaeger")
+	require.NoError(t, err)
+	agent, err := cfg.CreateAgent(fakeCollectorProxy{}, logger, mFactory)
+	require.NoError(t, err)
+
+	// This test attempts to hit the data race bug when Stop() is called
+	// immediately after Run(). We had a bug like that which is now fixed:
+	// https://github.com/jaegertracing/jaeger/issues/1624
+	// Before the bug was fixed this test was failing as expected when
+	// run with -race flag.
+
+	if err := agent.Run(); err != nil {
+		t.Errorf("error from agent.Run(): %s", err)
+	}
+
+	agent.Stop()
 
 	for i := 0; i < 1000; i++ {
 		if strings.Contains(logBuf.String(), "agent's http server exiting") {

@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,12 +17,13 @@ package spanstore
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/opentracing/opentracing-go"
 	ottag "github.com/opentracing/opentracing-go/ext"
 	otlog "github.com/opentracing/opentracing-go/log"
-	"github.com/pkg/errors"
 	"github.com/uber/jaeger-lib/metrics"
 	"go.uber.org/zap"
 
@@ -70,27 +72,27 @@ const (
 
 var (
 	// ErrServiceNameNotSet occurs when attempting to query with an empty service name
-	ErrServiceNameNotSet = errors.New("Service Name must be set")
+	ErrServiceNameNotSet = errors.New("service Name must be set")
 
 	// ErrStartTimeMinGreaterThanMax occurs when start time min is above start time max
-	ErrStartTimeMinGreaterThanMax = errors.New("Start Time Minimum is above Maximum")
+	ErrStartTimeMinGreaterThanMax = errors.New("start Time Minimum is above Maximum")
 
 	// ErrDurationMinGreaterThanMax occurs when duration min is above duration max
-	ErrDurationMinGreaterThanMax = errors.New("Duration Minimum is above Maximum")
+	ErrDurationMinGreaterThanMax = errors.New("duration Minimum is above Maximum")
 
 	// ErrMalformedRequestObject occurs when a request object is nil
-	ErrMalformedRequestObject = errors.New("Malformed request object")
+	ErrMalformedRequestObject = errors.New("malformed request object")
 
 	// ErrDurationAndTagQueryNotSupported occurs when duration and tags are both set
-	ErrDurationAndTagQueryNotSupported = errors.New("Cannot query for duration and tags simultaneously")
+	ErrDurationAndTagQueryNotSupported = errors.New("cannot query for duration and tags simultaneously")
 
 	// ErrStartAndEndTimeNotSet occurs when start time and end time are not set
-	ErrStartAndEndTimeNotSet = errors.New("Start and End Time must be set")
+	ErrStartAndEndTimeNotSet = errors.New("start and End Time must be set")
 )
 
 type serviceNamesReader func() ([]string, error)
 
-type operationNamesReader func(service string) ([]string, error)
+type operationNamesReader func(query spanstore.OperationQueryParameters) ([]spanstore.Operation, error)
 
 type spanReaderMetrics struct {
 	readTraces                 *casMetrics.Table
@@ -116,7 +118,7 @@ func NewSpanReader(
 	metricsFactory metrics.Factory,
 	logger *zap.Logger,
 ) *SpanReader {
-	readFactory := metricsFactory.Namespace("read", nil)
+	readFactory := metricsFactory.Namespace(metrics.NSOptions{Name: "read", Tags: nil})
 	serviceNamesStorage := NewServiceNamesStorage(session, 0, metricsFactory, logger)
 	operationNamesStorage := NewOperationNamesStorage(session, 0, metricsFactory, logger)
 	return &SpanReader{
@@ -142,8 +144,11 @@ func (s *SpanReader) GetServices(ctx context.Context) ([]string, error) {
 }
 
 // GetOperations returns all operations for a specific service traced by Jaeger
-func (s *SpanReader) GetOperations(ctx context.Context, service string) ([]string, error) {
-	return s.operationNamesReader(service)
+func (s *SpanReader) GetOperations(
+	ctx context.Context,
+	query spanstore.OperationQueryParameters,
+) ([]spanstore.Operation, error) {
+	return s.operationNamesReader(query)
 }
 
 func (s *SpanReader) readTrace(ctx context.Context, traceID dbmodel.TraceID) (*model.Trace, error) {
@@ -195,7 +200,7 @@ func (s *SpanReader) readTraceInSpan(ctx context.Context, traceID dbmodel.TraceI
 	err := i.Close()
 	s.metrics.readTraces.Emit(err, time.Since(start))
 	if err != nil {
-		return nil, errors.Wrap(err, "Error reading traces from storage")
+		return nil, fmt.Errorf("error reading traces from storage: %w", err)
 	}
 	if len(retMe.Spans) == 0 {
 		return nil, spanstore.ErrTraceNotFound
@@ -232,22 +237,13 @@ func validateQuery(p *spanstore.TraceQueryParameters) error {
 
 // FindTraces retrieves traces that match the traceQuery
 func (s *SpanReader) FindTraces(ctx context.Context, traceQuery *spanstore.TraceQueryParameters) ([]*model.Trace, error) {
-	if err := validateQuery(traceQuery); err != nil {
-		return nil, err
-	}
-	if traceQuery.NumTraces == 0 {
-		traceQuery.NumTraces = defaultNumTraces
-	}
-	uniqueTraceIDs, err := s.findTraceIDs(ctx, traceQuery)
+	uniqueTraceIDs, err := s.FindTraceIDs(ctx, traceQuery)
 	if err != nil {
 		return nil, err
 	}
 	var retMe []*model.Trace
-	for traceID := range uniqueTraceIDs {
-		if len(retMe) >= traceQuery.NumTraces {
-			break
-		}
-		jTrace, err := s.readTrace(ctx, traceID)
+	for _, traceID := range uniqueTraceIDs {
+		jTrace, err := s.GetTrace(ctx, traceID)
 		if err != nil {
 			s.logger.Error("Failure to read trace", zap.String("trace_id", traceID.String()), zap.Error(err))
 			continue
@@ -255,6 +251,30 @@ func (s *SpanReader) FindTraces(ctx context.Context, traceQuery *spanstore.Trace
 		retMe = append(retMe, jTrace)
 	}
 	return retMe, nil
+}
+
+// FindTraceIDs retrieve traceIDs that match the traceQuery
+func (s *SpanReader) FindTraceIDs(ctx context.Context, traceQuery *spanstore.TraceQueryParameters) ([]model.TraceID, error) {
+	if err := validateQuery(traceQuery); err != nil {
+		return nil, err
+	}
+	if traceQuery.NumTraces == 0 {
+		traceQuery.NumTraces = defaultNumTraces
+	}
+
+	dbTraceIDs, err := s.findTraceIDs(ctx, traceQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	var traceIDs []model.TraceID
+	for t := range dbTraceIDs {
+		if len(traceIDs) >= traceQuery.NumTraces {
+			break
+		}
+		traceIDs = append(traceIDs, t.ToDomain())
+	}
+	return traceIDs, nil
 }
 
 func (s *SpanReader) findTraceIDs(ctx context.Context, traceQuery *spanstore.TraceQueryParameters) (dbmodel.UniqueTraceIDs, error) {
@@ -291,7 +311,7 @@ func (s *SpanReader) queryByTagsAndLogs(ctx context.Context, tq *spanstore.Trace
 
 	results := make([]dbmodel.UniqueTraceIDs, 0, len(tq.Tags))
 	for k, v := range tq.Tags {
-		childSpan := opentracing.StartSpan("queryByTag")
+		childSpan, _ := opentracing.StartSpanFromContext(ctx, "queryByTag")
 		childSpan.LogFields(otlog.String("tag.key", k), otlog.String("tag.value", v))
 		query := s.session.Query(
 			queryByTag,
@@ -330,7 +350,7 @@ func (s *SpanReader) queryByDuration(ctx context.Context, traceQuery *spanstore.
 	endTimeByHour := traceQuery.StartTimeMax.Round(durationBucketSize)
 
 	for timeBucket := endTimeByHour; timeBucket.After(startTimeByHour) || timeBucket.Equal(startTimeByHour); timeBucket = timeBucket.Add(-1 * durationBucketSize) {
-		childSpan := opentracing.StartSpan("queryForTimeBucket")
+		childSpan, _ := opentracing.StartSpanFromContext(ctx, "queryForTimeBucket")
 		childSpan.LogFields(otlog.String("timeBucket", timeBucket.String()))
 		query := s.session.Query(
 			queryByDuration,
@@ -357,7 +377,7 @@ func (s *SpanReader) queryByDuration(ctx context.Context, traceQuery *spanstore.
 }
 
 func (s *SpanReader) queryByServiceNameAndOperation(ctx context.Context, tq *spanstore.TraceQueryParameters) (dbmodel.UniqueTraceIDs, error) {
-	span, ctx := startSpanForQuery(ctx, "queryByServiceNameAndOperation", queryByServiceAndOperationName)
+	span, _ := startSpanForQuery(ctx, "queryByServiceNameAndOperation", queryByServiceAndOperationName)
 	defer span.Finish()
 	query := s.session.Query(
 		queryByServiceAndOperationName,
@@ -371,7 +391,7 @@ func (s *SpanReader) queryByServiceNameAndOperation(ctx context.Context, tq *spa
 }
 
 func (s *SpanReader) queryByService(ctx context.Context, tq *spanstore.TraceQueryParameters) (dbmodel.UniqueTraceIDs, error) {
-	span, ctx := startSpanForQuery(ctx, "queryByService", queryByServiceName)
+	span, _ := startSpanForQuery(ctx, "queryByService", queryByServiceName)
 	defer span.Finish()
 	query := s.session.Query(
 		queryByServiceName,
@@ -395,7 +415,8 @@ func (s *SpanReader) executeQuery(span opentracing.Span, query cassandra.Query, 
 	tableMetrics.Emit(err, time.Since(start))
 	if err != nil {
 		logErrorToSpan(span, err)
-		s.logger.Error("Failed to exec query", zap.Error(err))
+		span.LogFields(otlog.String("query", query.String()))
+		s.logger.Error("Failed to exec query", zap.Error(err), zap.String("query", query.String()))
 		return nil, err
 	}
 	return retMe, nil

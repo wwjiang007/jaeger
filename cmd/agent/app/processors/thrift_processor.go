@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +23,7 @@ import (
 	"github.com/uber/jaeger-lib/metrics"
 	"go.uber.org/zap"
 
-	"github.com/jaegertracing/jaeger/cmd/agent/app/customtransports"
+	"github.com/jaegertracing/jaeger/cmd/agent/app/customtransport"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/servers"
 )
 
@@ -43,7 +44,10 @@ type ThriftProcessor struct {
 	}
 }
 
-// AgentProcessor handler used by the processor to process thrift and call the reporter with the deserialized struct
+// AgentProcessor handler used by the processor to process thrift and call the reporter
+// with the deserialized struct. This interface is implemented directly by Thrift generated
+// code, e.g. jaegerThrift.NewAgentProcessor(handler), where handler implements the Agent
+// Thrift service interface, which is invoked with the deserialized struct.
 type AgentProcessor interface {
 	Process(iprot, oprot thrift.TProtocol) (success bool, err thrift.TException)
 }
@@ -59,7 +63,7 @@ func NewThriftProcessor(
 ) (*ThriftProcessor, error) {
 	if numProcessors <= 0 {
 		return nil, fmt.Errorf(
-			"Number of processors must be greater than 0, called with %d", numProcessors)
+			"number of processors must be greater than 0, called with %d", numProcessors)
 	}
 	var protocolPool = &sync.Pool{
 		New: func() interface{} {
@@ -76,16 +80,18 @@ func NewThriftProcessor(
 		numProcessors: numProcessors,
 	}
 	metrics.Init(&res.metrics, mFactory, nil)
+	res.processing.Add(res.numProcessors)
+	for i := 0; i < res.numProcessors; i++ {
+		go func() {
+			res.processBuffer()
+			res.processing.Done()
+		}()
+	}
 	return res, nil
 }
 
-// Serve initiates the readers and starts serving traffic
+// Serve starts serving traffic
 func (s *ThriftProcessor) Serve() {
-	s.processing.Add(s.numProcessors)
-	for i := 0; i < s.numProcessors; i++ {
-		go s.processBuffer()
-	}
-
 	s.server.Serve()
 }
 
@@ -111,13 +117,12 @@ func (s *ThriftProcessor) processBuffer() {
 		payload := readBuf.GetBytes()
 		protocol.Transport().Write(payload)
 		s.logger.Debug("Span(s) received by the agent", zap.Int("bytes-received", len(payload)))
-		s.server.DataRecd(readBuf) // acknowledge receipt and release the buffer
 
-		if ok, _ := s.handler.Process(protocol, protocol); !ok {
-			// TODO log the error
+		if ok, err := s.handler.Process(protocol, protocol); !ok {
+			s.logger.Error("Processor failed", zap.Error(err))
 			s.metrics.HandlerProcessError.Inc(1)
 		}
 		s.protocolPool.Put(protocol)
+		s.server.DataRecd(readBuf) // acknowledge receipt and release the buffer
 	}
-	s.processing.Done()
 }

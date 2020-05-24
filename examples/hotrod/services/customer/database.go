@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,7 +62,7 @@ func newDatabase(tracer opentracing.Tracer, logger log.Factory) *database {
 			},
 			"731": {
 				ID:       "731",
-				Name:     "Japanese Deserts",
+				Name:     "Japanese Desserts",
 				Location: "728,326",
 			},
 		},
@@ -76,6 +77,7 @@ func (d *database) Get(ctx context.Context, customerID string) (*Customer, error
 		span := d.tracer.StartSpan("SQL SELECT", opentracing.ChildOf(span.Context()))
 		tags.SpanKindRPCClient.Set(span)
 		tags.PeerService.Set(span, "mysql")
+		// #nosec
 		span.SetTag("sql.query", "SELECT * FROM customer WHERE customer_id="+customerID)
 		defer span.Finish()
 		ctx = opentracing.ContextWithSpan(ctx, span)

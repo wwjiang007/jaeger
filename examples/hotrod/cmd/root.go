@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,7 +32,6 @@ import (
 
 var (
 	metricsBackend string
-	jAgentHostPort string
 	logger         *zap.Logger
 	metricsFactory metrics.Factory
 
@@ -43,6 +43,8 @@ var (
 	driverPort   int
 	frontendPort int
 	routePort    int
+
+	basepath string
 )
 
 // RootCmd represents the base command when called without any subcommands
@@ -63,8 +65,7 @@ func Execute() {
 
 func init() {
 	RootCmd.PersistentFlags().StringVarP(&metricsBackend, "metrics", "m", "expvar", "Metrics backend (expvar|prometheus)")
-	RootCmd.PersistentFlags().StringVarP(&jAgentHostPort, "jaeger-agent.host-port", "a", "0.0.0.0:6831", "String representing jaeger-agent UDP host:port, or jaeger-collector HTTP endpoint address, e.g. http://localhost:14268/api/traces.")
-	RootCmd.PersistentFlags().DurationVarP(&fixDBConnDelay, "fix-db-query-delay", "D", 300*time.Millisecond, "Average lagency of MySQL DB query")
+	RootCmd.PersistentFlags().DurationVarP(&fixDBConnDelay, "fix-db-query-delay", "D", 300*time.Millisecond, "Average latency of MySQL DB query")
 	RootCmd.PersistentFlags().BoolVarP(&fixDBConnDisableMutex, "fix-disable-db-conn-mutex", "M", false, "Disables the mutex guarding db connection")
 	RootCmd.PersistentFlags().IntVarP(&fixRouteWorkerPoolSize, "fix-route-worker-pool-size", "W", 3, "Default worker pool size")
 
@@ -74,6 +75,9 @@ func init() {
 	RootCmd.PersistentFlags().IntVarP(&frontendPort, "frontend-service-port", "f", 8080, "Port for frontend service")
 	RootCmd.PersistentFlags().IntVarP(&routePort, "route-service-port", "r", 8083, "Port for routing service")
 
+	// Flag for serving frontend at custom basepath url
+	RootCmd.PersistentFlags().StringVarP(&basepath, "basepath", "b", "", `Basepath for frontend service(default "/")`)
+
 	rand.Seed(int64(time.Now().Nanosecond()))
 	logger, _ = zap.NewDevelopment(zap.AddStacktrace(zapcore.FatalLevel))
 	cobra.OnInitialize(onInitialize)
@@ -81,13 +85,14 @@ func init() {
 
 // onInitialize is called before the command is executed.
 func onInitialize() {
-	if metricsBackend == "expvar" {
+	switch metricsBackend {
+	case "expvar":
 		metricsFactory = jexpvar.NewFactory(10) // 10 buckets for histograms
 		logger.Info("Using expvar as metrics backend")
-	} else if metricsBackend == "prometheus" {
-		metricsFactory = jprom.New().Namespace("hotrod", nil)
+	case "prometheus":
+		metricsFactory = jprom.New().Namespace(metrics.NSOptions{Name: "hotrod", Tags: nil})
 		logger.Info("Using Prometheus as metrics backend")
-	} else {
+	default:
 		logger.Fatal("unsupported metrics backend " + metricsBackend)
 	}
 	if config.MySQLGetDelay != fixDBConnDelay {
@@ -117,6 +122,10 @@ func onInitialize() {
 
 	if routePort != 8083 {
 		logger.Info("changing route service port", zap.Int("old", 8083), zap.Int("new", routePort))
+	}
+
+	if basepath != "" {
+		logger.Info("changing basepath for frontend", zap.String("old", "/"), zap.String("new", basepath))
 	}
 }
 

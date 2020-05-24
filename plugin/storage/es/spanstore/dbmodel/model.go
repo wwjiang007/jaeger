@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2018 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -86,9 +87,15 @@ type Log struct {
 	Fields    []KeyValue `json:"fields"`
 }
 
-// KeyValue is a a key-value pair with typed value.
+// KeyValue is a key-value pair with typed value.
 type KeyValue struct {
 	Key   string      `json:"key"`
 	Type  ValueType   `json:"type,omitempty"`
 	Value interface{} `json:"value"`
+}
+
+// Service is the JSON struct for service:operation documents in ElasticSearch
+type Service struct {
+	ServiceName   string `json:"serviceName"`
+	OperationName string `json:"operationName"`
 }

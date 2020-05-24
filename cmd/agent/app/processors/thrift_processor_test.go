@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,14 +24,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/uber/jaeger-lib/metrics"
-	mTestutils "github.com/uber/jaeger-lib/metrics/testutils"
+	"github.com/uber/jaeger-lib/metrics/metricstest"
 	"go.uber.org/zap"
 
 	"github.com/jaegertracing/jaeger/cmd/agent/app/reporter"
-	tchreporter "github.com/jaegertracing/jaeger/cmd/agent/app/reporter/tchannel"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/servers"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/servers/thriftudp"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/testutils"
+	tchreporter "github.com/jaegertracing/jaeger/tchannel/agent/app/reporter/tchannel"
 	"github.com/jaegertracing/jaeger/thrift-gen/agent"
 	"github.com/jaegertracing/jaeger/thrift-gen/jaeger"
 	"github.com/jaegertracing/jaeger/thrift-gen/zipkincore"
@@ -75,15 +76,15 @@ func createProcessor(t *testing.T, mFactory metrics.Factory, tFactory thrift.TPr
 	return transport.Addr().String(), processor
 }
 
-func initCollectorAndReporter(t *testing.T) (*metrics.LocalFactory, *testutils.MockTCollector, reporter.Reporter) {
+func initCollectorAndReporter(t *testing.T) (*metricstest.Factory, *testutils.MockTCollector, reporter.Reporter) {
 	metricsFactory, collector := testutils.InitMockCollector(t)
-	reporter := tchreporter.New("jaeger-collector", collector.Channel, nil, metricsFactory, zap.NewNop())
+	reporter := reporter.WrapWithMetrics(tchreporter.New("jaeger-collector", collector.Channel, time.Second, nil, zap.NewNop()), metricsFactory)
 	return metricsFactory, collector, reporter
 }
 
 func TestNewThriftProcessor_ZeroCount(t *testing.T) {
 	_, err := NewThriftProcessor(nil, 0, nil, nil, nil, zap.NewNop())
-	assert.EqualError(t, err, "Number of processors must be greater than 0, called with 0")
+	assert.EqualError(t, err, "number of processors must be greater than 0, called with 0")
 }
 
 func TestProcessorWithCompactZipkin(t *testing.T) {
@@ -115,7 +116,7 @@ func (h failingHandler) Process(iprot, oprot thrift.TProtocol) (success bool, er
 }
 
 func TestProcessor_HandlerError(t *testing.T) {
-	metricsFactory := metrics.NewLocalFactory(0)
+	metricsFactory := metricstest.NewFactory(0)
 
 	handler := failingHandler{err: errors.New("doh")}
 
@@ -137,9 +138,9 @@ func TestProcessor_HandlerError(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	mTestutils.AssertCounterMetrics(t, metricsFactory,
-		mTestutils.ExpectedMetric{Name: "thrift.udp.t-processor.handler-errors", Value: 1},
-		mTestutils.ExpectedMetric{Name: "thrift.udp.server.packets.processed", Value: 1},
+	metricsFactory.AssertCounterMetrics(t,
+		metricstest.ExpectedMetric{Name: "thrift.udp.t-processor.handler-errors", Value: 1},
+		metricstest.ExpectedMetric{Name: "thrift.udp.server.packets.processed", Value: 1},
 	)
 }
 
@@ -170,7 +171,7 @@ func TestJaegerProcessor(t *testing.T) {
 	}
 }
 
-func assertJaegerProcessorCorrectness(t *testing.T, collector *testutils.MockTCollector, metricsFactory *metrics.LocalFactory) {
+func assertJaegerProcessorCorrectness(t *testing.T, collector *testutils.MockTCollector, metricsFactory *metricstest.Factory) {
 	sizeF := func() int {
 		return len(collector.GetJaegerBatches())
 	}
@@ -180,7 +181,7 @@ func assertJaegerProcessorCorrectness(t *testing.T, collector *testutils.MockTCo
 	assertProcessorCorrectness(t, metricsFactory, sizeF, nameF, "jaeger")
 }
 
-func assertZipkinProcessorCorrectness(t *testing.T, collector *testutils.MockTCollector, metricsFactory *metrics.LocalFactory) {
+func assertZipkinProcessorCorrectness(t *testing.T, collector *testutils.MockTCollector, metricsFactory *metricstest.Factory) {
 	sizeF := func() int {
 		return len(collector.GetZipkinSpans())
 	}
@@ -192,7 +193,7 @@ func assertZipkinProcessorCorrectness(t *testing.T, collector *testutils.MockTCo
 
 func assertProcessorCorrectness(
 	t *testing.T,
-	metricsFactory *metrics.LocalFactory,
+	metricsFactory *metricstest.Factory,
 	sizeF func() int,
 	nameF func() string,
 	format string,
@@ -218,9 +219,9 @@ func assertProcessorCorrectness(
 	}
 
 	// agentReporter must emit metrics
-	mTestutils.AssertCounterMetrics(t, metricsFactory, []mTestutils.ExpectedMetric{
-		{Name: "tchannel-reporter.batches.submitted", Tags: map[string]string{"format": format}, Value: 1},
-		{Name: "tchannel-reporter.spans.submitted", Tags: map[string]string{"format": format}, Value: 1},
+	metricsFactory.AssertCounterMetrics(t, []metricstest.ExpectedMetric{
+		{Name: "reporter.batches.submitted", Tags: map[string]string{"format": format}, Value: 1},
+		{Name: "reporter.spans.submitted", Tags: map[string]string{"format": format}, Value: 1},
 		{Name: "thrift.udp.server.packets.processed", Value: 1},
 	}...)
 }

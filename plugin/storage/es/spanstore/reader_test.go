@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,16 +19,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/ioutil"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/olivere/elastic"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/uber/jaeger-lib/metrics"
+	"github.com/uber/jaeger-lib/metrics/metricstest"
 	"go.uber.org/zap"
-	"gopkg.in/olivere/elastic.v5"
 
 	"github.com/jaegertracing/jaeger/model"
 	"github.com/jaegertracing/jaeger/pkg/es/mocks"
@@ -91,12 +95,32 @@ func withSpanReader(fn func(r *spanReaderTest)) {
 		client:    client,
 		logger:    logger,
 		logBuffer: logBuffer,
-		reader: newSpanReader(SpanReaderParams{
+		reader: NewSpanReader(SpanReaderParams{
 			Client:            client,
 			Logger:            zap.NewNop(),
-			MaxLookback:       0,
+			MaxSpanAge:        0,
 			IndexPrefix:       "",
 			TagDotReplacement: "@",
+		}),
+	}
+	fn(r)
+}
+
+func withArchiveSpanReader(readAlias bool, fn func(r *spanReaderTest)) {
+	client := &mocks.Client{}
+	logger, logBuffer := testutils.NewLogger()
+	r := &spanReaderTest{
+		client:    client,
+		logger:    logger,
+		logBuffer: logBuffer,
+		reader: NewSpanReader(SpanReaderParams{
+			Client:              client,
+			Logger:              zap.NewNop(),
+			MaxSpanAge:          0,
+			IndexPrefix:         "",
+			TagDotReplacement:   "@",
+			Archive:             true,
+			UseReadWriteAliases: readAlias,
 		}),
 	}
 	fn(r)
@@ -109,30 +133,48 @@ func TestNewSpanReader(t *testing.T) {
 	reader := NewSpanReader(SpanReaderParams{
 		Client:         client,
 		Logger:         zap.NewNop(),
-		MaxLookback:    0,
+		MaxSpanAge:     0,
 		MetricsFactory: metrics.NullFactory,
 		IndexPrefix:    ""})
 	assert.NotNil(t, reader)
 }
 
-func TestNewSpanReaderIndexPrefix(t *testing.T) {
+func TestSpanReaderIndices(t *testing.T) {
+	client := &mocks.Client{}
+	logger, _ := testutils.NewLogger()
+	metricsFactory := metricstest.NewFactory(0)
+	date := time.Date(2019, 10, 10, 5, 0, 0, 0, time.UTC)
+	dateFormat := date.UTC().Format("2006-01-02")
 	testCases := []struct {
-		prefix   string
-		expected string
+		index  string
+		params SpanReaderParams
 	}{
-		{prefix: "", expected: ""},
-		{prefix: "foo", expected: "foo:"},
-		{prefix: ":", expected: "::"},
+		{params: SpanReaderParams{Client: client, Logger: logger, MetricsFactory: metricsFactory,
+			IndexPrefix: "", Archive: false},
+			index: spanIndex + dateFormat},
+		{params: SpanReaderParams{Client: client, Logger: logger, MetricsFactory: metricsFactory,
+			IndexPrefix: "", UseReadWriteAliases: true},
+			index: spanIndex + "read"},
+		{params: SpanReaderParams{Client: client, Logger: logger, MetricsFactory: metricsFactory,
+			IndexPrefix: "foo:", Archive: false},
+			index: "foo:" + indexPrefixSeparator + spanIndex + dateFormat},
+		{params: SpanReaderParams{Client: client, Logger: logger, MetricsFactory: metricsFactory,
+			IndexPrefix: "foo:", UseReadWriteAliases: true},
+			index: "foo:-" + spanIndex + "read"},
+		{params: SpanReaderParams{Client: client, Logger: logger, MetricsFactory: metricsFactory,
+			IndexPrefix: "", Archive: true},
+			index: spanIndex + archiveIndexSuffix},
+		{params: SpanReaderParams{Client: client, Logger: logger, MetricsFactory: metricsFactory,
+			IndexPrefix: "foo:", Archive: true},
+			index: "foo:" + indexPrefixSeparator + spanIndex + archiveIndexSuffix},
+		{params: SpanReaderParams{Client: client, Logger: logger, MetricsFactory: metricsFactory,
+			IndexPrefix: "foo:", Archive: true, UseReadWriteAliases: true},
+			index: "foo:" + indexPrefixSeparator + spanIndex + archiveReadIndexSuffix},
 	}
 	for _, testCase := range testCases {
-		client := &mocks.Client{}
-		r := newSpanReader(SpanReaderParams{
-			Client:      client,
-			Logger:      zap.NewNop(),
-			MaxLookback: 0,
-			IndexPrefix: testCase.prefix})
-		assert.Equal(t, testCase.expected+spanIndex, r.spanIndexPrefix)
-		assert.Equal(t, testCase.expected+serviceIndex, r.serviceIndexPrefix)
+		r := NewSpanReader(testCase.params)
+		actual := r.timeRangeIndices(r.spanIndexPrefix, date, date)
+		assert.Equal(t, []string{testCase.index}, actual)
 	}
 }
 
@@ -161,6 +203,86 @@ func TestSpanReader_GetTrace(t *testing.T) {
 
 		require.Len(t, trace.Spans, 1)
 		assert.EqualValues(t, trace.Spans[0], expectedSpans[0])
+	})
+}
+
+func TestSpanReader_multiRead_followUp_query(t *testing.T) {
+	withSpanReader(func(r *spanReaderTest) {
+		date := time.Date(2019, 10, 10, 5, 0, 0, 0, time.UTC)
+		spanID1 := dbmodel.Span{SpanID: "0", TraceID: "1", StartTime: model.TimeAsEpochMicroseconds(date)}
+		spanBytesID1, err := json.Marshal(spanID1)
+		require.NoError(t, err)
+		spanID2 := dbmodel.Span{SpanID: "0", TraceID: "2", StartTime: model.TimeAsEpochMicroseconds(date)}
+		spanBytesID2, err := json.Marshal(spanID2)
+		require.NoError(t, err)
+
+		id1Query := elastic.NewBoolQuery().Should(
+			elastic.NewTermQuery(traceIDField, model.TraceID{High: 0, Low: 1}.String()).Boost(2),
+			elastic.NewTermQuery(traceIDField, fmt.Sprintf("%x", 1)))
+		id1Search := elastic.NewSearchRequest().
+			IgnoreUnavailable(true).
+			Source(r.reader.sourceFn(id1Query, model.TimeAsEpochMicroseconds(date.Add(-time.Hour))))
+		id2Query := elastic.NewBoolQuery().Should(
+			elastic.NewTermQuery(traceIDField, model.TraceID{High: 0, Low: 2}.String()).Boost(2),
+			elastic.NewTermQuery(traceIDField, fmt.Sprintf("%x", 2)))
+		id2Search := elastic.NewSearchRequest().
+			IgnoreUnavailable(true).
+			Source(r.reader.sourceFn(id2Query, model.TimeAsEpochMicroseconds(date.Add(-time.Hour))))
+		id1SearchSpanTime := elastic.NewSearchRequest().
+			IgnoreUnavailable(true).
+			Source(r.reader.sourceFn(id1Query, spanID1.StartTime))
+
+		multiSearchService := &mocks.MultiSearchService{}
+		firstMultiSearch := &mocks.MultiSearchService{}
+		secondMultiSearch := &mocks.MultiSearchService{}
+		multiSearchService.On("Add", id1Search, id2Search).Return(firstMultiSearch)
+		multiSearchService.On("Add", id1SearchSpanTime).Return(secondMultiSearch)
+
+		firstMultiSearch.On("Index", mock.AnythingOfType("string")).Return(firstMultiSearch)
+		secondMultiSearch.On("Index", mock.AnythingOfType("string")).Return(secondMultiSearch)
+		r.client.On("MultiSearch").Return(multiSearchService)
+
+		fistMultiSearchMock := firstMultiSearch.On("Do", mock.AnythingOfType("*context.emptyCtx"))
+		secondMultiSearchMock := secondMultiSearch.On("Do", mock.AnythingOfType("*context.emptyCtx"))
+
+		// set TotalHits to two to trigger the follow up query
+		// the client will return only one span therefore the implementation
+		// triggers follow up query for the same traceID with the timestamp of the last span
+		searchHitsID1 := &elastic.SearchHits{Hits: []*elastic.SearchHit{
+			{Source: (*json.RawMessage)(&spanBytesID1)},
+		}, TotalHits: 2}
+		fistMultiSearchMock.
+			Return(&elastic.MultiSearchResult{
+				Responses: []*elastic.SearchResult{
+					{Hits: searchHitsID1},
+				},
+			}, nil)
+
+		searchHitsID2 := &elastic.SearchHits{Hits: []*elastic.SearchHit{
+			{Source: (*json.RawMessage)(&spanBytesID2)},
+		}, TotalHits: 1}
+		secondMultiSearchMock.
+			Return(&elastic.MultiSearchResult{
+				Responses: []*elastic.SearchResult{
+					{Hits: searchHitsID2},
+				},
+			}, nil)
+
+		traces, err := r.reader.multiRead(context.Background(), []model.TraceID{{High: 0, Low: 1}, {High: 0, Low: 2}}, date, date)
+		require.NoError(t, err)
+		require.NotNil(t, traces)
+		require.Len(t, traces, 2)
+
+		toDomain := dbmodel.NewToDomain("-")
+		sModel1, err := toDomain.SpanToDomain(&spanID1)
+		require.NoError(t, err)
+		sModel2, err := toDomain.SpanToDomain(&spanID2)
+		require.NoError(t, err)
+
+		for _, s := range []*model.Span{sModel1, sModel2} {
+			found := reflect.DeepEqual(traces[0].Spans[0], s) || reflect.DeepEqual(traces[1].Spans[0], s)
+			assert.True(t, found, "span was expected to be within one of the traces but was not: %v", s)
+		}
 	})
 }
 
@@ -203,7 +325,7 @@ func TestSpanReader_GetTraceQueryError(t *testing.T) {
 				Responses: []*elastic.SearchResult{},
 			}, nil)
 		trace, err := r.reader.GetTrace(context.Background(), model.NewTraceID(0, 1))
-		require.EqualError(t, err, "No trace with that ID found")
+		require.EqualError(t, err, "trace not found")
 		require.Nil(t, trace)
 	})
 }
@@ -222,7 +344,7 @@ func TestSpanReader_GetTraceNilHits(t *testing.T) {
 			}, nil)
 
 		trace, err := r.reader.GetTrace(context.Background(), model.NewTraceID(0, 1))
-		require.EqualError(t, err, "No trace with that ID found")
+		require.EqualError(t, err, "trace not found")
 		require.Nil(t, trace)
 	})
 }
@@ -343,7 +465,7 @@ func TestSpanReaderFindIndices(t *testing.T) {
 	}
 	withSpanReader(func(r *spanReaderTest) {
 		for _, testCase := range testCases {
-			actual := r.reader.indicesForTimeRange(spanIndex, testCase.startTime, testCase.endTime)
+			actual := r.reader.timeRangeIndices(spanIndex, testCase.startTime, testCase.endTime)
 			assert.EqualValues(t, testCase.expected, actual)
 		}
 	})
@@ -369,51 +491,68 @@ func testGet(typ string, t *testing.T) {
 		caption        string
 		searchResult   *elastic.SearchResult
 		searchError    error
-		expectedError  string
-		expectedOutput []string
+		expectedError  func() string
+		expectedOutput map[string]interface{}
 	}{
 		{
-			caption:        typ + " full behavior",
-			searchResult:   &elastic.SearchResult{Aggregations: elastic.Aggregations(goodAggregations)},
-			expectedOutput: []string{"123"},
+			caption:      typ + " full behavior",
+			searchResult: &elastic.SearchResult{Aggregations: elastic.Aggregations(goodAggregations)},
+			expectedOutput: map[string]interface{}{
+				operationsAggregation: []spanstore.Operation{{Name: "123"}},
+				"default":             []string{"123"},
+			},
+			expectedError: func() string {
+				return ""
+			},
 		},
 		{
-			caption:       typ + " search error",
-			searchError:   errors.New("Search failure"),
-			expectedError: "Search service failed: Search failure",
+			caption:     typ + " search error",
+			searchError: errors.New("Search failure"),
+			expectedError: func() string {
+				if typ == operationsAggregation {
+					return "search operations failed: Search failure"
+				}
+				return "search services failed: Search failure"
+			},
 		},
 		{
-			caption:       typ + " search error",
-			searchResult:  &elastic.SearchResult{Aggregations: elastic.Aggregations(badAggregations)},
-			expectedError: "Could not find aggregation of " + typ,
+			caption:      typ + " search error",
+			searchResult: &elastic.SearchResult{Aggregations: elastic.Aggregations(badAggregations)},
+			expectedError: func() string {
+				return "could not find aggregation of " + typ
+			},
 		},
 	}
+
 	for _, tc := range testCases {
 		testCase := tc
 		t.Run(testCase.caption, func(t *testing.T) {
 			withSpanReader(func(r *spanReaderTest) {
 				mockSearchService(r).Return(testCase.searchResult, testCase.searchError)
-
 				actual, err := returnSearchFunc(typ, r)
-				if testCase.expectedError != "" {
-					require.EqualError(t, err, testCase.expectedError)
+				if testCase.expectedError() != "" {
+					require.EqualError(t, err, testCase.expectedError())
 					assert.Nil(t, actual)
+				} else if expectedOutput, ok := testCase.expectedOutput[typ]; ok {
+					assert.EqualValues(t, expectedOutput, actual)
 				} else {
-					require.NoError(t, err)
-					assert.EqualValues(t, testCase.expectedOutput, actual)
+					assert.EqualValues(t, testCase.expectedOutput["default"], actual)
 				}
 			})
 		})
 	}
 }
 
-func returnSearchFunc(typ string, r *spanReaderTest) ([]string, error) {
+func returnSearchFunc(typ string, r *spanReaderTest) (interface{}, error) {
 	if typ == servicesAggregation {
 		return r.reader.GetServices(context.Background())
 	} else if typ == operationsAggregation {
-		return r.reader.GetOperations(context.Background(), "someService")
+		return r.reader.GetOperations(
+			context.Background(),
+			spanstore.OperationQueryParameters{ServiceName: "someService"},
+		)
 	} else if typ == traceIDAggregation {
-		return r.reader.findTraceIDs(&spanstore.TraceQueryParameters{})
+		return r.reader.findTraceIDs(context.Background(), &spanstore.TraceQueryParameters{})
 	}
 	return nil, errors.New("Specify services, operations, traceIDs only")
 }
@@ -439,7 +578,7 @@ func TestSpanReader_bucketToStringArrayError(t *testing.T) {
 		buckets[2] = &elastic.AggregationBucketKeyItem{Key: 2}
 
 		_, err := bucketToStringArray(buckets)
-		assert.EqualError(t, err, "Non-string key found in aggregation")
+		assert.EqualError(t, err, "non-string key found in aggregation")
 	})
 }
 
@@ -668,19 +807,36 @@ func TestFindTraceIDs(t *testing.T) {
 	testGet(traceIDAggregation, t)
 }
 
+func TestTraceIDsStringsToModelsConversion(t *testing.T) {
+	traceIDs, err := convertTraceIDsStringsToModels([]string{"1", "2", "3"})
+	assert.NoError(t, err)
+	assert.Equal(t, 3, len(traceIDs))
+	assert.Equal(t, model.NewTraceID(0, 1), traceIDs[0])
+
+	traceIDs, err = convertTraceIDsStringsToModels([]string{"dsfjsdklfjdsofdfsdbfkgbgoaemlrksdfbsdofgerjl"})
+	assert.EqualError(t, err, "making traceID from string 'dsfjsdklfjdsofdfsdbfkgbgoaemlrksdfbsdofgerjl' failed: TraceID cannot be longer than 32 hex characters: dsfjsdklfjdsofdfsdbfkgbgoaemlrksdfbsdofgerjl")
+	assert.Equal(t, 0, len(traceIDs))
+}
+
 func mockMultiSearchService(r *spanReaderTest) *mock.Call {
 	multiSearchService := &mocks.MultiSearchService{}
 	multiSearchService.On("Add", mock.Anything, mock.Anything, mock.Anything).Return(multiSearchService)
 	multiSearchService.On("Index", mock.AnythingOfType("string"), mock.AnythingOfType("string"),
 		mock.AnythingOfType("string"), mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(multiSearchService)
 	r.client.On("MultiSearch").Return(multiSearchService)
-	return multiSearchService.On("Do", mock.AnythingOfType("*context.emptyCtx"))
+	return multiSearchService.On("Do", mock.AnythingOfType("*context.valueCtx"))
+}
+
+func mockArchiveMultiSearchService(r *spanReaderTest, indexName string) *mock.Call {
+	multiSearchService := &mocks.MultiSearchService{}
+	multiSearchService.On("Add", mock.Anything, mock.Anything, mock.Anything).Return(multiSearchService)
+	multiSearchService.On("Index", indexName).Return(multiSearchService)
+	r.client.On("MultiSearch").Return(multiSearchService)
+	return multiSearchService.On("Do", mock.AnythingOfType("*context.valueCtx"))
 }
 
 func mockSearchService(r *spanReaderTest) *mock.Call {
 	searchService := &mocks.SearchService{}
-	searchService.On("Type", stringMatcher(serviceType)).Return(searchService)
-	searchService.On("Type", stringMatcher(spanType)).Return(searchService)
 	searchService.On("Query", mock.Anything).Return(searchService)
 	searchService.On("IgnoreUnavailable", mock.AnythingOfType("bool")).Return(searchService)
 	searchService.On("Size", mock.MatchedBy(func(i int) bool {
@@ -690,7 +846,10 @@ func mockSearchService(r *spanReaderTest) *mock.Call {
 	searchService.On("Aggregation", stringMatcher(operationsAggregation), mock.AnythingOfType("*elastic.TermsAggregation")).Return(searchService)
 	searchService.On("Aggregation", stringMatcher(traceIDAggregation), mock.AnythingOfType("*elastic.TermsAggregation")).Return(searchService)
 	r.client.On("Search", mock.AnythingOfType("string"), mock.AnythingOfType("string"), mock.AnythingOfType("string"), mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(searchService)
-	return searchService.On("Do", mock.AnythingOfType("*context.emptyCtx"))
+	return searchService.On("Do", mock.MatchedBy(func(ctx context.Context) bool {
+		t := reflect.TypeOf(ctx).String()
+		return t == "*context.valueCtx" || t == "*context.emptyCtx"
+	}))
 }
 
 func TestTraceQueryParameterValidation(t *testing.T) {
@@ -880,6 +1039,36 @@ func TestSpanReader_buildTagQuery(t *testing.T) {
 	})
 }
 
+func TestSpanReader_buildTagRegexQuery(t *testing.T) {
+	inStr, err := ioutil.ReadFile("fixtures/query_02.json")
+	require.NoError(t, err)
+	withSpanReader(func(r *spanReaderTest) {
+		tagQuery := r.reader.buildTagQuery("bat.foo", "spo.*")
+		actual, err := tagQuery.Source()
+		require.NoError(t, err)
+
+		expected := make(map[string]interface{})
+		json.Unmarshal(inStr, &expected)
+
+		assert.EqualValues(t, expected, actual)
+	})
+}
+
+func TestSpanReader_buildTagRegexEscapedQuery(t *testing.T) {
+	inStr, err := ioutil.ReadFile("fixtures/query_03.json")
+	require.NoError(t, err)
+	withSpanReader(func(r *spanReaderTest) {
+		tagQuery := r.reader.buildTagQuery("bat.foo", "spo\\*")
+		actual, err := tagQuery.Source()
+		require.NoError(t, err)
+
+		expected := make(map[string]interface{})
+		json.Unmarshal(inStr, &expected)
+
+		assert.EqualValues(t, expected, actual)
+	})
+}
+
 func TestSpanReader_GetEmptyIndex(t *testing.T) {
 	withSpanReader(func(r *spanReaderTest) {
 		mockSearchService(r).
@@ -903,4 +1092,76 @@ func TestSpanReader_GetEmptyIndex(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, services)
 	})
+}
+
+func TestSpanReader_ArchiveTraces(t *testing.T) {
+	withArchiveSpanReader(false, func(r *spanReaderTest) {
+		mockSearchService(r).
+			Return(&elastic.SearchResult{}, nil)
+		mockArchiveMultiSearchService(r, "jaeger-span-archive").
+			Return(&elastic.MultiSearchResult{
+				Responses: []*elastic.SearchResult{},
+			}, nil)
+
+		trace, err := r.reader.GetTrace(context.Background(), model.TraceID{})
+		require.Nil(t, trace)
+		assert.EqualError(t, err, "trace not found")
+	})
+}
+
+func TestSpanReader_ArchiveTraces_ReadAlias(t *testing.T) {
+	withArchiveSpanReader(true, func(r *spanReaderTest) {
+		mockSearchService(r).
+			Return(&elastic.SearchResult{}, nil)
+		mockArchiveMultiSearchService(r, "jaeger-span-archive-read").
+			Return(&elastic.MultiSearchResult{
+				Responses: []*elastic.SearchResult{},
+			}, nil)
+
+		trace, err := r.reader.GetTrace(context.Background(), model.TraceID{})
+		require.Nil(t, trace)
+		assert.EqualError(t, err, "trace not found")
+	})
+}
+
+func TestConvertTraceIDsStringsToModels(t *testing.T) {
+	ids, err := convertTraceIDsStringsToModels([]string{"1", "2", "01", "02", "001", "002"})
+	require.NoError(t, err)
+	assert.Equal(t, []model.TraceID{model.NewTraceID(0, 1), model.NewTraceID(0, 2)}, ids)
+	_, err = convertTraceIDsStringsToModels([]string{"1", "2", "01", "02", "001", "002", "blah"})
+	assert.Error(t, err)
+}
+
+func TestBuildTraceByIDQuery(t *testing.T) {
+	uintMax := ^uint64(0)
+	traceIDNoHigh := model.NewTraceID(0, 1)
+	traceIDHigh := model.NewTraceID(1, 1)
+	traceID := model.NewTraceID(uintMax, uintMax)
+	tests := []struct {
+		traceID model.TraceID
+		query   elastic.Query
+	}{
+		{
+			traceID: traceIDNoHigh,
+			query: elastic.NewBoolQuery().Should(
+				elastic.NewTermQuery(traceIDField, "0000000000000001").Boost(2),
+				elastic.NewTermQuery(traceIDField, "1"),
+			),
+		},
+		{
+			traceID: traceIDHigh,
+			query: elastic.NewBoolQuery().Should(
+				elastic.NewTermQuery(traceIDField, "00000000000000010000000000000001").Boost(2),
+				elastic.NewTermQuery(traceIDField, "10000000000000001"),
+			),
+		},
+		{
+			traceID: traceID,
+			query:   elastic.NewTermQuery(traceIDField, "ffffffffffffffffffffffffffffffff"),
+		},
+	}
+	for _, test := range tests {
+		q := buildTraceByIDQuery(test.traceID)
+		assert.Equal(t, test.query, q)
+	}
 }

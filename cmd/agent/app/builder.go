@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,41 +17,38 @@ package app
 
 import (
 	"fmt"
+	"io"
 	"net/http"
-	"time"
+	"strconv"
 
 	"github.com/apache/thrift/lib/go/thrift"
-	"github.com/pkg/errors"
 	"github.com/uber/jaeger-lib/metrics"
-	"github.com/uber/tchannel-go"
 	"go.uber.org/zap"
 
+	"github.com/jaegertracing/jaeger/cmd/agent/app/configmanager"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/httpserver"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/processors"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/reporter"
-	tchreporter "github.com/jaegertracing/jaeger/cmd/agent/app/reporter/tchannel"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/servers"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/servers/thriftudp"
-	jmetrics "github.com/jaegertracing/jaeger/pkg/metrics"
+	"github.com/jaegertracing/jaeger/ports"
 	zipkinThrift "github.com/jaegertracing/jaeger/thrift-gen/agent"
 	jaegerThrift "github.com/jaegertracing/jaeger/thrift-gen/jaeger"
 )
 
 const (
-	defaultQueueSize        = 1000
-	defaultMaxPacketSize    = 65000
-	defaultServerWorkers    = 10
-	defaultMinPeers         = 3
-	defaultConnCheckTimeout = 250 * time.Millisecond
-
-	defaultHTTPServerHostPort = ":5778"
+	defaultQueueSize     = 1000
+	defaultMaxPacketSize = 65000
+	defaultServerWorkers = 10
 
 	jaegerModel Model = "jaeger"
-	zipkinModel       = "zipkin"
+	zipkinModel Model = "zipkin"
 
 	compactProtocol Protocol = "compact"
-	binaryProtocol           = "binary"
+	binaryProtocol  Protocol = "binary"
 )
+
+var defaultHTTPServerHostPort = ":" + strconv.Itoa(ports.AgentConfigServerHTTP)
 
 // Model used to distinguish the data transfer model
 type Model string
@@ -59,24 +57,25 @@ type Model string
 type Protocol string
 
 var (
-	errNoReporters = errors.New("agent requires at least one Reporter")
-
 	protocolFactoryMap = map[Protocol]thrift.TProtocolFactory{
 		compactProtocol: thrift.NewTCompactProtocolFactory(),
 		binaryProtocol:  thrift.NewTBinaryProtocolFactoryDefault(),
 	}
 )
 
+// CollectorProxy provides access to Reporter and ClientConfigManager
+type CollectorProxy interface {
+	GetReporter() reporter.Reporter
+	GetManager() configmanager.ClientConfigManager
+	io.Closer
+}
+
 // Builder Struct to hold configurations
 type Builder struct {
 	Processors []ProcessorConfiguration `yaml:"processors"`
 	HTTPServer HTTPServerConfiguration  `yaml:"httpServer"`
-	Metrics    jmetrics.Builder         `yaml:"metrics"`
 
-	tchreporter.Builder `yaml:",inline"`
-
-	otherReporters []reporter.Reporter
-	metricsFactory metrics.Factory
+	reporters []reporter.Reporter
 }
 
 // ProcessorConfiguration holds config for a processor that receives spans from Server
@@ -100,62 +99,35 @@ type HTTPServerConfiguration struct {
 }
 
 // WithReporter adds auxiliary reporters.
-func (b *Builder) WithReporter(r reporter.Reporter) *Builder {
-	b.otherReporters = append(b.otherReporters, r)
+func (b *Builder) WithReporter(r ...reporter.Reporter) *Builder {
+	b.reporters = append(b.reporters, r...)
 	return b
-}
-
-// WithMetricsFactory sets an externally initialized metrics factory.
-func (b *Builder) WithMetricsFactory(mf metrics.Factory) *Builder {
-	b.metricsFactory = mf
-	return b
-}
-
-func (b *Builder) createMainReporter(mFactory metrics.Factory, logger *zap.Logger) (*tchreporter.Reporter, error) {
-	return b.CreateReporter(mFactory, logger)
-}
-
-func (b *Builder) getMetricsFactory() (metrics.Factory, error) {
-	if b.metricsFactory != nil {
-		return b.metricsFactory, nil
-	}
-
-	baseFactory, err := b.Metrics.CreateMetricsFactory("jaeger")
-	if err != nil {
-		return nil, err
-	}
-
-	return baseFactory.Namespace("agent", nil), nil
 }
 
 // CreateAgent creates the Agent
-func (b *Builder) CreateAgent(logger *zap.Logger) (*Agent, error) {
-	mFactory, err := b.getMetricsFactory()
+func (b *Builder) CreateAgent(primaryProxy CollectorProxy, logger *zap.Logger, mFactory metrics.Factory) (*Agent, error) {
+	r := b.getReporter(primaryProxy)
+	processors, err := b.getProcessors(r, mFactory, logger)
 	if err != nil {
-		return nil, errors.Wrap(err, "cannot create metrics factory")
+		return nil, fmt.Errorf("cannot create processors: %w", err)
 	}
-	mainReporter, err := b.createMainReporter(mFactory, logger)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot create main Reporter")
-	}
-	var rep reporter.Reporter = mainReporter
-	if len(b.otherReporters) > 0 {
-		reps := append([]reporter.Reporter{mainReporter}, b.otherReporters...)
-		rep = reporter.NewMultiReporter(reps...)
-	}
-	processors, err := b.GetProcessors(rep, mFactory, logger)
-	if err != nil {
-		return nil, err
-	}
-	httpServer := b.HTTPServer.GetHTTPServer(b.CollectorServiceName, mainReporter.Channel(), mFactory)
-	if h := b.Metrics.Handler(); mFactory != nil && h != nil {
-		httpServer.Handler.(*http.ServeMux).Handle(b.Metrics.HTTPRoute, h)
-	}
-	return NewAgent(processors, httpServer, logger), nil
+	server := b.HTTPServer.getHTTPServer(primaryProxy.GetManager(), mFactory)
+	return NewAgent(processors, server, logger), nil
 }
 
-// GetProcessors creates Processors with attached Reporter
-func (b *Builder) GetProcessors(rep reporter.Reporter, mFactory metrics.Factory, logger *zap.Logger) ([]processors.Processor, error) {
+func (b *Builder) getReporter(primaryProxy CollectorProxy) reporter.Reporter {
+	if len(b.reporters) == 0 {
+		return primaryProxy.GetReporter()
+	}
+	rep := make([]reporter.Reporter, len(b.reporters)+1)
+	rep[0] = primaryProxy.GetReporter()
+	for i, r := range b.reporters {
+		rep[i+1] = r
+	}
+	return reporter.NewMultiReporter(rep...)
+}
+
+func (b *Builder) getProcessors(rep reporter.Reporter, mFactory metrics.Factory, logger *zap.Logger) ([]processors.Processor, error) {
 	retMe := make([]processors.Processor, len(b.Processors))
 	for idx, cfg := range b.Processors {
 		protoFactory, ok := protocolFactoryMap[cfg.Protocol]
@@ -171,13 +143,13 @@ func (b *Builder) GetProcessors(rep reporter.Reporter, mFactory metrics.Factory,
 		default:
 			return nil, fmt.Errorf("cannot find agent processor for data model %v", cfg.Model)
 		}
-		metrics := mFactory.Namespace("", map[string]string{
+		metrics := mFactory.Namespace(metrics.NSOptions{Name: "", Tags: map[string]string{
 			"protocol": string(cfg.Protocol),
 			"model":    string(cfg.Model),
-		})
+		}})
 		processor, err := cfg.GetThriftProcessor(metrics, protoFactory, handler, logger)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("cannot create Thrift Processor: %w", err)
 		}
 		retMe[idx] = processor
 	}
@@ -185,12 +157,11 @@ func (b *Builder) GetProcessors(rep reporter.Reporter, mFactory metrics.Factory,
 }
 
 // GetHTTPServer creates an HTTP server that provides sampling strategies and baggage restrictions to client libraries.
-func (c HTTPServerConfiguration) GetHTTPServer(svc string, channel *tchannel.Channel, mFactory metrics.Factory) *http.Server {
-	mgr := httpserver.NewCollectorProxy(svc, channel, mFactory)
+func (c HTTPServerConfiguration) getHTTPServer(manager configmanager.ClientConfigManager, mFactory metrics.Factory) *http.Server {
 	if c.HostPort == "" {
 		c.HostPort = defaultHTTPServerHostPort
 	}
-	return httpserver.NewHTTPServer(c.HostPort, mgr, mFactory)
+	return httpserver.NewHTTPServer(c.HostPort, manager, mFactory)
 }
 
 // GetThriftProcessor gets a TBufferedServer backed Processor using the collector configuration
@@ -204,7 +175,7 @@ func (c *ProcessorConfiguration) GetThriftProcessor(
 
 	server, err := c.Server.getUDPServer(mFactory)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot create UDP Server: %w", err)
 	}
 
 	return processors.NewThriftProcessor(server, c.Workers, mFactory, factory, handler, logger)
@@ -228,7 +199,7 @@ func (c *ServerConfiguration) getUDPServer(mFactory metrics.Factory) (servers.Se
 	}
 	transport, err := thriftudp.NewTUDPServerTransport(c.HostPort)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot create UDPServerTransport: %w", err)
 	}
 
 	return servers.NewTBufferedServer(transport, c.QueueSize, c.MaxPacketSize, mFactory)
@@ -239,4 +210,26 @@ func defaultInt(value int, defaultVal int) int {
 		value = defaultVal
 	}
 	return value
+}
+
+// ProxyBuilderOptions holds config for CollectorProxyBuilder
+type ProxyBuilderOptions struct {
+	reporter.Options
+	Logger  *zap.Logger
+	Metrics metrics.Factory
+}
+
+// CollectorProxyBuilder is a func which builds CollectorProxy.
+type CollectorProxyBuilder func(ProxyBuilderOptions) (CollectorProxy, error)
+
+// CreateCollectorProxy creates collector proxy
+func CreateCollectorProxy(
+	opts ProxyBuilderOptions,
+	builders map[reporter.Type]CollectorProxyBuilder,
+) (CollectorProxy, error) {
+	builder, ok := builders[opts.ReporterType]
+	if !ok {
+		return nil, fmt.Errorf("unknown reporter type %s", string(opts.ReporterType))
+	}
+	return builder(opts)
 }

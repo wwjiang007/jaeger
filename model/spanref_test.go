@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +28,7 @@ import (
 func TestSpanRefTypeToFromJSON(t *testing.T) {
 	// base64(0x42, 16 bytes) == AAAAAAAAAAAAAAAAAAAAQg==
 	// base64(0x43, 8 bytes) == AAAAAAAAAEM=
-	// Verify: https://cryptii.com/base64-to-hex
+	// Verify: https://cryptii.com/pipes/base64-to-hex
 	sr := model.SpanRef{
 		TraceID: model.NewTraceID(0, 0x42),
 		SpanID:  model.NewSpanID(0x43),

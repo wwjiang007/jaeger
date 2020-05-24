@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,16 +23,17 @@ import (
 	"mime"
 	"net/http"
 	"strings"
-	"time"
 
-	"github.com/apache/thrift/lib/go/thrift"
 	"github.com/go-openapi/loads"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
+	"github.com/golang/protobuf/proto"
 	"github.com/gorilla/mux"
-	tchanThrift "github.com/uber/tchannel-go/thrift"
 
-	"github.com/jaegertracing/jaeger/cmd/collector/app"
+	"github.com/jaegertracing/jaeger/cmd/collector/app/handler"
+	"github.com/jaegertracing/jaeger/cmd/collector/app/processor"
+	"github.com/jaegertracing/jaeger/model/converter/thrift/zipkin"
+	zipkinProto "github.com/jaegertracing/jaeger/proto-gen/zipkin"
 	"github.com/jaegertracing/jaeger/swagger-gen/models"
 	"github.com/jaegertracing/jaeger/swagger-gen/restapi"
 	"github.com/jaegertracing/jaeger/swagger-gen/restapi/operations"
@@ -40,13 +42,13 @@ import (
 
 // APIHandler handles all HTTP calls to the collector
 type APIHandler struct {
-	zipkinSpansHandler app.ZipkinSpansHandler
+	zipkinSpansHandler handler.ZipkinSpansHandler
 	zipkinV2Formats    strfmt.Registry
 }
 
 // NewAPIHandler returns a new APIHandler
 func NewAPIHandler(
-	zipkinSpansHandler app.ZipkinSpansHandler,
+	zipkinSpansHandler handler.ZipkinSpansHandler,
 ) *APIHandler {
 	swaggerSpec, _ := loads.Analyzed(restapi.SwaggerJSON, "")
 	return &APIHandler{
@@ -67,7 +69,7 @@ func (aH *APIHandler) saveSpans(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(r.Header.Get("Content-Encoding"), "gzip") {
 		gz, err := gunzip(bRead)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(app.UnableToReadBodyErrFormat, err), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf(handler.UnableToReadBodyErrFormat, err), http.StatusBadRequest)
 			return
 		}
 		defer gz.Close()
@@ -76,7 +78,7 @@ func (aH *APIHandler) saveSpans(w http.ResponseWriter, r *http.Request) {
 
 	bodyBytes, err := ioutil.ReadAll(bRead)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(app.UnableToReadBodyErrFormat, err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(handler.UnableToReadBodyErrFormat, err), http.StatusInternalServerError)
 		return
 	}
 
@@ -88,16 +90,17 @@ func (aH *APIHandler) saveSpans(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var tSpans []*zipkincore.Span
-	if contentType == "application/x-thrift" {
-		tSpans, err = deserializeThrift(bodyBytes)
-	} else if contentType == "application/json" {
+	switch contentType {
+	case "application/x-thrift":
+		tSpans, err = zipkin.DeserializeThrift(bodyBytes)
+	case "application/json":
 		tSpans, err = DeserializeJSON(bodyBytes)
-	} else {
+	default:
 		http.Error(w, "Unsupported Content-Type", http.StatusBadRequest)
 		return
 	}
 	if err != nil {
-		http.Error(w, fmt.Sprintf(app.UnableToReadBodyErrFormat, err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf(handler.UnableToReadBodyErrFormat, err), http.StatusBadRequest)
 		return
 	}
 
@@ -115,7 +118,7 @@ func (aH *APIHandler) saveSpansV2(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(r.Header.Get("Content-Encoding"), "gzip") {
 		gz, err := gunzip(bRead)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(app.UnableToReadBodyErrFormat, err), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf(handler.UnableToReadBodyErrFormat, err), http.StatusBadRequest)
 			return
 		}
 		defer gz.Close()
@@ -124,7 +127,7 @@ func (aH *APIHandler) saveSpansV2(w http.ResponseWriter, r *http.Request) {
 
 	bodyBytes, err := ioutil.ReadAll(bRead)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(app.UnableToReadBodyErrFormat, err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(handler.UnableToReadBodyErrFormat, err), http.StatusInternalServerError)
 		return
 	}
 
@@ -135,33 +138,57 @@ func (aH *APIHandler) saveSpansV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if contentType != "application/json" {
+	var tSpans []*zipkincore.Span
+	switch contentType {
+	case "application/json":
+		tSpans, err = jsonToThriftSpansV2(bodyBytes, aH.zipkinV2Formats)
+	case "application/x-protobuf":
+		tSpans, err = protoToThriftSpansV2(bodyBytes)
+	default:
 		http.Error(w, "Unsupported Content-Type", http.StatusBadRequest)
 		return
 	}
 
-	var spans models.ListOfSpans
-	if err = swag.ReadJSON(bodyBytes, &spans); err != nil {
-		http.Error(w, fmt.Sprintf(app.UnableToReadBodyErrFormat, err), http.StatusBadRequest)
-		return
-	}
-	if err = spans.Validate(aH.zipkinV2Formats); err != nil {
-		http.Error(w, fmt.Sprintf(app.UnableToReadBodyErrFormat, err), http.StatusBadRequest)
-		return
-	}
-
-	tSpans, err := spansV2ToThrift(spans)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(app.UnableToReadBodyErrFormat, err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf(handler.UnableToReadBodyErrFormat, err), http.StatusBadRequest)
 		return
 	}
 
-	if err := aH.saveThriftSpans(tSpans); err != nil {
+	if err = aH.saveThriftSpans(tSpans); err != nil {
 		http.Error(w, fmt.Sprintf("Cannot submit Zipkin batch: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(operations.PostSpansAcceptedCode)
+}
+
+func jsonToThriftSpansV2(bodyBytes []byte, zipkinV2Formats strfmt.Registry) ([]*zipkincore.Span, error) {
+	var spans models.ListOfSpans
+	if err := swag.ReadJSON(bodyBytes, &spans); err != nil {
+		return nil, err
+	}
+	if err := spans.Validate(zipkinV2Formats); err != nil {
+		return nil, err
+	}
+
+	tSpans, err := spansV2ToThrift(spans)
+	if err != nil {
+		return nil, err
+	}
+	return tSpans, nil
+}
+
+func protoToThriftSpansV2(bodyBytes []byte) ([]*zipkincore.Span, error) {
+	var spans zipkinProto.ListOfSpans
+	if err := proto.Unmarshal(bodyBytes, &spans); err != nil {
+		return nil, err
+	}
+
+	tSpans, err := protoSpansV2ToThrift(&spans)
+	if err != nil {
+		return nil, err
+	}
+	return tSpans, nil
 }
 
 func gunzip(r io.ReadCloser) (*gzip.Reader, error) {
@@ -174,34 +201,10 @@ func gunzip(r io.ReadCloser) (*gzip.Reader, error) {
 
 func (aH *APIHandler) saveThriftSpans(tSpans []*zipkincore.Span) error {
 	if len(tSpans) > 0 {
-		ctx, _ := tchanThrift.NewContext(time.Minute)
-		if _, err := aH.zipkinSpansHandler.SubmitZipkinBatch(ctx, tSpans); err != nil {
+		opts := handler.SubmitBatchOptions{InboundTransport: processor.HTTPTransport}
+		if _, err := aH.zipkinSpansHandler.SubmitZipkinBatch(tSpans, opts); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func deserializeThrift(b []byte) ([]*zipkincore.Span, error) {
-	buffer := thrift.NewTMemoryBuffer()
-	buffer.Write(b)
-
-	transport := thrift.NewTBinaryProtocolTransport(buffer)
-	_, size, err := transport.ReadListBegin() // Ignore the returned element type
-	if err != nil {
-		return nil, err
-	}
-
-	// We don't depend on the size returned by ReadListBegin to preallocate the array because it
-	// sometimes returns a nil error on bad input and provides an unreasonably large int for size
-	var spans []*zipkincore.Span
-	for i := 0; i < size; i++ {
-		zs := &zipkincore.Span{}
-		if err = zs.Read(transport); err != nil {
-			return nil, err
-		}
-		spans = append(spans, zs)
-	}
-
-	return spans, nil
 }

@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,7 +50,8 @@ func TestOptionsWithFlags(t *testing.T) {
 	v, command := config.Viperize(opts.AddFlags)
 	command.ParseFlags([]string{
 		"--cas.keyspace=jaeger",
-		"--cas.servers=1.1.1.1,2.2.2.2",
+		"--cas.local-dc=mojave",
+		"--cas.servers=1.1.1.1, 2.2.2.2",
 		"--cas.connections-per-host=42",
 		"--cas.reconnect-interval=42s",
 		"--cas.max-retry-attempts=42",
@@ -58,17 +60,29 @@ func TestOptionsWithFlags(t *testing.T) {
 		"--cas.consistency=ONE",
 		"--cas.proto-version=3",
 		"--cas.socket-keep-alive=42s",
+		"--cas.index.tag-blacklist=blerg, blarg,blorg ",
+		"--cas.index.tag-whitelist=flerg, flarg,florg ",
+		"--cas.index.tags=true",
+		"--cas.index.process-tags=false",
 		// enable aux with a couple overrides
 		"--cas-aux.enabled=true",
 		"--cas-aux.keyspace=jaeger-archive",
-		"--cas-aux.servers=3.3.3.3,4.4.4.4",
+		"--cas-aux.servers=3.3.3.3, 4.4.4.4",
+		"--cas-aux.enable-dependencies-v2=true",
 	})
 	opts.InitFromViper(v)
 
 	primary := opts.GetPrimary()
 	assert.Equal(t, "jaeger", primary.Keyspace)
+	assert.Equal(t, "mojave", primary.LocalDC)
 	assert.Equal(t, []string{"1.1.1.1", "2.2.2.2"}, primary.Servers)
 	assert.Equal(t, "ONE", primary.Consistency)
+	assert.Equal(t, false, primary.EnableDependenciesV2)
+	assert.Equal(t, []string{"blerg", "blarg", "blorg"}, opts.TagIndexBlacklist())
+	assert.Equal(t, []string{"flerg", "flarg", "florg"}, opts.TagIndexWhitelist())
+	assert.Equal(t, true, opts.Index.Tags)
+	assert.Equal(t, false, opts.Index.ProcessTags)
+	assert.Equal(t, true, opts.Index.Logs)
 
 	aux := opts.Get("cas-aux")
 	require.NotNil(t, aux)
@@ -82,4 +96,39 @@ func TestOptionsWithFlags(t *testing.T) {
 	assert.Equal(t, "", aux.Consistency, "aux storage does not inherit consistency from primary")
 	assert.Equal(t, 3, aux.ProtoVersion)
 	assert.Equal(t, 42*time.Second, aux.SocketKeepAlive)
+	assert.Equal(t, true, aux.EnableDependenciesV2)
+}
+
+func TestDeprecatedTlsHostVerifyFlagShouldBeRespected(t *testing.T) {
+	opts := NewOptions("cas")
+	v, command := config.Viperize(opts.AddFlags)
+	command.ParseFlags([]string{
+		"--cas.tls.verify-host=false",
+	})
+	opts.InitFromViper(v)
+
+	primary := opts.GetPrimary()
+	assert.Equal(t, true, primary.TLS.SkipHostVerify)
+}
+
+func TestDefaultTlsHostVerify(t *testing.T) {
+	opts := NewOptions("cas")
+	v, command := config.Viperize(opts.AddFlags)
+	command.ParseFlags([]string{
+		"--cas.tls.enabled=true",
+	})
+	opts.InitFromViper(v)
+
+	primary := opts.GetPrimary()
+	assert.Equal(t, false, primary.TLS.SkipHostVerify)
+}
+
+func TestEmptyBlackWhiteLists(t *testing.T) {
+	opts := NewOptions("cas")
+	v, command := config.Viperize(opts.AddFlags)
+	command.ParseFlags([]string{})
+	opts.InitFromViper(v)
+
+	assert.Len(t, opts.TagIndexBlacklist(), 0)
+	assert.Len(t, opts.TagIndexWhitelist(), 0)
 }

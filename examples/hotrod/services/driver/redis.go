@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,9 +40,9 @@ type Redis struct {
 	errorSimulator
 }
 
-func newRedis(metricsFactory metrics.Factory, logger log.Factory, jAgentHostPort string) *Redis {
+func newRedis(metricsFactory metrics.Factory, logger log.Factory) *Redis {
 	return &Redis{
-		tracer: tracing.Init("redis", metricsFactory.Namespace("redis", nil), logger, jAgentHostPort),
+		tracer: tracing.Init("redis", metricsFactory, logger),
 		logger: logger,
 	}
 }
@@ -60,6 +61,7 @@ func (r *Redis) FindDriverIDs(ctx context.Context, location string) []string {
 
 	drivers := make([]string, 10)
 	for i := range drivers {
+		// #nosec
 		drivers[i] = fmt.Sprintf("T7%05dC", rand.Int()%100000)
 	}
 	r.logger.For(ctx).Info("Found drivers", zap.Strings("drivers", drivers))
@@ -85,6 +87,7 @@ func (r *Redis) GetDriver(ctx context.Context, driverID string) (Driver, error) 
 		return Driver{}, err
 	}
 
+	// #nosec
 	return Driver{
 		DriverID: driverID,
 		Location: fmt.Sprintf("%d,%d", rand.Int()%1000, rand.Int()%1000),

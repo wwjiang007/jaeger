@@ -53,7 +53,13 @@ func (f *Factory) AddFlags(flagSet *flag.FlagSet) {
 // InitFromViper implements plugin.Configurable
 func (f *Factory) InitFromViper(v *viper.Viper) {
 	f.options.InitFromViper(v)
-	f.Builder = &f.options.config
+	f.Builder = &f.options.Config
+}
+
+// InitFromOptions initializes factory from options.
+func (f *Factory) InitFromOptions(o Options) {
+	f.options = o
+	f.Builder = &f.options.Config
 }
 
 // Initialize implements storage.Factory
@@ -61,19 +67,19 @@ func (f *Factory) Initialize(metricsFactory metrics.Factory, logger *zap.Logger)
 	f.metricsFactory, f.logger = metricsFactory, logger
 	logger.Info("Kafka factory",
 		zap.Any("producer builder", f.Builder),
-		zap.Any("topic", f.options.topic))
+		zap.Any("topic", f.options.Topic))
 	p, err := f.NewProducer()
 	if err != nil {
 		return err
 	}
 	f.producer = p
-	switch f.options.encoding {
-	case encodingProto:
+	switch f.options.Encoding {
+	case EncodingProto:
 		f.marshaller = newProtobufMarshaller()
-	case encodingJSON:
+	case EncodingJSON:
 		f.marshaller = newJSONMarshaller()
 	default:
-		return errors.New("kafka encoding is not one of '" + encodingJSON + "' or '" + encodingProto + "'")
+		return errors.New("kafka encoding is not one of '" + EncodingJSON + "' or '" + EncodingProto + "'")
 	}
 	return nil
 }
@@ -85,7 +91,7 @@ func (f *Factory) CreateSpanReader() (spanstore.Reader, error) {
 
 // CreateSpanWriter implements storage.Factory
 func (f *Factory) CreateSpanWriter() (spanstore.Writer, error) {
-	return NewSpanWriter(f.producer, f.marshaller, f.options.topic, f.metricsFactory, f.logger), nil
+	return NewSpanWriter(f.producer, f.marshaller, f.options.Topic, f.metricsFactory, f.logger), nil
 }
 
 // CreateDependencyReader implements storage.Factory

@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,7 +37,7 @@ type Server struct {
 }
 
 // NewServer creates a new driver.Server
-func NewServer(hostPort string, tracer opentracing.Tracer, metricsFactory metrics.Factory, logger log.Factory, jAgentHostPort string) *Server {
+func NewServer(hostPort string, tracer opentracing.Tracer, metricsFactory metrics.Factory, logger log.Factory) *Server {
 	channelOpts := &tchannel.ChannelOptions{
 		Tracer: tracer,
 	}
@@ -52,7 +53,7 @@ func NewServer(hostPort string, tracer opentracing.Tracer, metricsFactory metric
 		logger:   logger,
 		ch:       ch,
 		server:   server,
-		redis:    newRedis(metricsFactory, logger, jAgentHostPort),
+		redis:    newRedis(metricsFactory, logger),
 	}
 }
 

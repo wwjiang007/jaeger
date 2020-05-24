@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +26,7 @@ type Dependency struct {
 	Parent    string `cql:"parent"`
 	Child     string `cql:"child"`
 	CallCount int64  `cql:"call_count"` // always unsigned, but we cannot explicitly read uint64 from Cassandra
+	Source    string `cql:"source"`
 }
 
 // MarshalUDT handles marshalling a Dependency.
@@ -36,6 +38,8 @@ func (d *Dependency) MarshalUDT(name string, info gocql.TypeInfo) ([]byte, error
 		return gocql.Marshal(info, d.Child)
 	case "call_count":
 		return gocql.Marshal(info, d.CallCount)
+	case "source":
+		return gocql.Marshal(info, d.Source)
 	default:
 		return nil, fmt.Errorf("unknown column for position: %q", name)
 	}
@@ -50,6 +54,8 @@ func (d *Dependency) UnmarshalUDT(name string, info gocql.TypeInfo, data []byte)
 		return gocql.Unmarshal(info, data, &d.Child)
 	case "call_count":
 		return gocql.Unmarshal(info, data, &d.CallCount)
+	case "source":
+		return gocql.Unmarshal(info, data, &d.Source)
 	default:
 		return fmt.Errorf("unknown column for position: %q", name)
 	}

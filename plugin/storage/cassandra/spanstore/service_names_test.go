@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +23,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
-	"github.com/uber/jaeger-lib/metrics"
+	"github.com/uber/jaeger-lib/metrics/metricstest"
 	"go.uber.org/zap"
 
 	"github.com/jaegertracing/jaeger/pkg/cassandra/mocks"
@@ -32,7 +33,7 @@ import (
 type serviceNameStorageTest struct {
 	session        *mocks.Session
 	writeCacheTTL  time.Duration
-	metricsFactory *metrics.LocalFactory
+	metricsFactory *metricstest.Factory
 	logger         *zap.Logger
 	logBuffer      *testutils.Buffer
 	storage        *ServiceNamesStorage
@@ -41,7 +42,7 @@ type serviceNameStorageTest struct {
 func withServiceNamesStorage(writeCacheTTL time.Duration, fn func(s *serviceNameStorageTest)) {
 	session := &mocks.Session{}
 	logger, logBuffer := testutils.NewLogger()
-	metricsFactory := metrics.NewLocalFactory(time.Second)
+	metricsFactory := metricstest.NewFactory(time.Second)
 	defer metricsFactory.Stop()
 	s := &serviceNameStorageTest{
 		session:        session,
@@ -136,7 +137,7 @@ func TestServiceNamesStorageGetServices(t *testing.T) {
 				// expect empty string because mock iter.Scan(&placeholder) does not write to `placeholder`
 				assert.Equal(t, []string{""}, services)
 			} else {
-				assert.EqualError(t, err, "Error reading service_names from storage: "+expErr.Error())
+				assert.EqualError(t, err, "error reading service_names from storage: "+expErr.Error())
 			}
 		})
 

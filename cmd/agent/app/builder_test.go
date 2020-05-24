@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,16 +17,29 @@ package app
 
 import (
 	"errors"
+	"flag"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/uber/jaeger-lib/metrics"
+	"github.com/uber/jaeger-lib/metrics/metricstest"
 	"go.uber.org/zap"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 
+	"github.com/jaegertracing/jaeger/cmd/agent/app/configmanager"
+	"github.com/jaegertracing/jaeger/cmd/agent/app/reporter"
+	"github.com/jaegertracing/jaeger/cmd/agent/app/reporter/grpc"
+	"github.com/jaegertracing/jaeger/tchannel/agent/app/reporter/tchannel"
+	"github.com/jaegertracing/jaeger/tchannel/collector/app"
+	"github.com/jaegertracing/jaeger/thrift-gen/baggage"
 	"github.com/jaegertracing/jaeger/thrift-gen/jaeger"
+	"github.com/jaegertracing/jaeger/thrift-gen/sampling"
 	"github.com/jaegertracing/jaeger/thrift-gen/zipkincore"
 )
 
@@ -51,14 +65,6 @@ processors:
 
 httpServer:
     hostPort: 4.4.4.4:5778
-
-collectorHostPorts:
-    - 127.0.0.1:14267
-    - 127.0.0.1:14268
-    - 127.0.0.1:14269
-
-collectorServiceName: some-collector-service
-minPeers: 4
 `
 
 func TestBuilderFromConfig(t *testing.T) {
@@ -101,57 +107,13 @@ func TestBuilderFromConfig(t *testing.T) {
 		},
 	}, cfg.Processors[2])
 	assert.Equal(t, "4.4.4.4:5778", cfg.HTTPServer.HostPort)
-
-	assert.Equal(t, 4, cfg.DiscoveryMinPeers)
-	assert.Equal(t, "some-collector-service", cfg.CollectorServiceName)
-	assert.Equal(
-		t,
-		[]string{"127.0.0.1:14267", "127.0.0.1:14268", "127.0.0.1:14269"},
-		cfg.CollectorHostPorts)
 }
 
 func TestBuilderWithExtraReporter(t *testing.T) {
 	cfg := &Builder{}
-	cfg.WithReporter(fakeReporter{})
-	agent, err := cfg.CreateAgent(zap.NewNop())
+	agent, err := cfg.CreateAgent(fakeCollectorProxy{}, zap.NewNop(), metrics.NullFactory)
 	assert.NoError(t, err)
 	assert.NotNil(t, agent)
-}
-
-func TestBuilderMetrics(t *testing.T) {
-	mf := metrics.NullFactory
-	b := new(Builder).WithMetricsFactory(mf)
-	mf2, err := b.getMetricsFactory()
-	assert.NoError(t, err)
-	assert.Equal(t, mf, mf2)
-}
-
-func TestBuilderMetricsHandler(t *testing.T) {
-	b := &Builder{}
-	b.Metrics.Backend = "expvar"
-	b.Metrics.HTTPRoute = "/expvar"
-	factory, err := b.Metrics.CreateMetricsFactory("test")
-	assert.NoError(t, err)
-	assert.NotNil(t, factory)
-	b.metricsFactory = factory
-	agent, err := b.CreateAgent(zap.NewNop())
-	assert.NoError(t, err)
-	assert.NotNil(t, agent)
-}
-
-func TestBuilderMetricsError(t *testing.T) {
-	b := &Builder{}
-	b.Metrics.Backend = "invalid"
-	_, err := b.CreateAgent(zap.NewNop())
-	assert.EqualError(t, err, "cannot create metrics factory: unknown metrics backend specified")
-}
-
-func TestBuilderWithDiscoveryError(t *testing.T) {
-	cfg := &Builder{}
-	cfg.WithDiscoverer(fakeDiscoverer{})
-	agent, err := cfg.CreateAgent(zap.NewNop())
-	assert.EqualError(t, err, "cannot create main Reporter: cannot enable service discovery: both discovery.Discoverer and discovery.Notifier must be specified")
-	assert.Nil(t, agent)
 }
 
 func TestBuilderWithProcessorErrors(t *testing.T) {
@@ -180,28 +142,129 @@ func TestBuilderWithProcessorErrors(t *testing.T) {
 				},
 			},
 		}
-		_, err := cfg.CreateAgent(zap.NewNop())
+		_, err := cfg.CreateAgent(&fakeCollectorProxy{}, zap.NewNop(), metrics.NullFactory)
 		assert.Error(t, err)
 		if testCase.err != "" {
-			assert.EqualError(t, err, testCase.err)
+			assert.Contains(t, err.Error(), testCase.err)
 		} else if testCase.errContains != "" {
 			assert.True(t, strings.Contains(err.Error(), testCase.errContains), "error must contain %s", testCase.errContains)
 		}
 	}
 }
 
-type fakeReporter struct{}
+func TestMultipleCollectorProxies(t *testing.T) {
+	b := Builder{}
+	ra := fakeCollectorProxy{}
+	rb := fakeCollectorProxy{}
+	b.WithReporter(ra)
+	r := b.getReporter(rb)
+	mr, ok := r.(reporter.MultiReporter)
+	require.True(t, ok)
+	fmt.Println(mr)
+	assert.Equal(t, rb, mr[0])
+	assert.Equal(t, ra, mr[1])
+}
 
-func (fr fakeReporter) EmitZipkinBatch(spans []*zipkincore.Span) (err error) {
+type fakeCollectorProxy struct {
+}
+
+func (f fakeCollectorProxy) GetReporter() reporter.Reporter {
+	return fakeCollectorProxy{}
+}
+func (f fakeCollectorProxy) GetManager() configmanager.ClientConfigManager {
+	return fakeCollectorProxy{}
+}
+
+func (fakeCollectorProxy) EmitZipkinBatch(spans []*zipkincore.Span) (err error) {
+	return nil
+}
+func (fakeCollectorProxy) EmitBatch(batch *jaeger.Batch) (err error) {
+	return nil
+}
+func (fakeCollectorProxy) Close() error {
 	return nil
 }
 
-func (fr fakeReporter) EmitBatch(batch *jaeger.Batch) (err error) {
-	return nil
+func (f fakeCollectorProxy) GetSamplingStrategy(serviceName string) (*sampling.SamplingStrategyResponse, error) {
+	return nil, errors.New("no peers available")
+}
+func (fakeCollectorProxy) GetBaggageRestrictions(serviceName string) ([]*baggage.BaggageRestriction, error) {
+	return nil, nil
 }
 
-type fakeDiscoverer struct{}
+func TestCreateCollectorProxy(t *testing.T) {
+	tests := []struct {
+		flags  []string
+		err    string
+		metric metricstest.ExpectedMetric
+	}{
+		{
+			err: "at least one collector hostPort address is required when resolver is not available",
+		},
+		{
+			flags: []string{"--collector.host-port=foo"},
+			err:   "at least one collector hostPort address is required when resolver is not available",
+		},
+		{
+			flags: []string{"--reporter.type=grpc", "--collector.host-port=foo"},
+			err:   "at least one collector hostPort address is required when resolver is not available",
+		},
+		{
+			flags:  []string{"--reporter.type=grpc", "--reporter.grpc.host-port=foo", "--collector.host-port=foo"},
+			metric: metricstest.ExpectedMetric{Name: "reporter.batches.failures", Tags: map[string]string{"protocol": "grpc", "format": "jaeger"}, Value: 1},
+		},
+		{
+			flags:  []string{"--reporter.type=grpc", "--reporter.grpc.host-port=foo"},
+			metric: metricstest.ExpectedMetric{Name: "reporter.batches.failures", Tags: map[string]string{"protocol": "grpc", "format": "jaeger"}, Value: 1},
+		},
+	}
 
-func (fd fakeDiscoverer) Instances() ([]string, error) {
-	return nil, errors.New("discoverer error")
+	for _, test := range tests {
+		flags := &flag.FlagSet{}
+		tchannel.AddFlags(flags)
+		grpc.AddFlags(flags)
+		reporter.AddFlags(flags)
+		app.AddFlags(flags)
+
+		command := cobra.Command{}
+		command.PersistentFlags().AddGoFlagSet(flags)
+		v := viper.New()
+		v.BindPFlags(command.PersistentFlags())
+
+		err := command.ParseFlags(test.flags)
+		require.NoError(t, err)
+
+		rOpts := new(reporter.Options).InitFromViper(v, zap.NewNop())
+		grpcBuilder := grpc.NewConnBuilder().InitFromViper(v)
+
+		metricsFactory := metricstest.NewFactory(time.Microsecond)
+
+		builders := map[reporter.Type]CollectorProxyBuilder{
+			reporter.GRPC: GRPCCollectorProxyBuilder(grpcBuilder),
+		}
+		proxy, err := CreateCollectorProxy(ProxyBuilderOptions{
+			Options: *rOpts,
+			Metrics: metricsFactory,
+			Logger:  zap.NewNop(),
+		}, builders)
+		if test.err != "" {
+			assert.EqualError(t, err, test.err)
+			assert.Nil(t, proxy)
+		} else {
+			require.NoError(t, err)
+			proxy.GetReporter().EmitBatch(jaeger.NewBatch())
+			metricsFactory.AssertCounterMetrics(t, test.metric)
+		}
+	}
+}
+
+func TestCreateCollectorProxy_UnknownReporter(t *testing.T) {
+	grpcBuilder := grpc.NewConnBuilder()
+
+	builders := map[reporter.Type]CollectorProxyBuilder{
+		reporter.GRPC: GRPCCollectorProxyBuilder(grpcBuilder),
+	}
+	proxy, err := CreateCollectorProxy(ProxyBuilderOptions{}, builders)
+	assert.Nil(t, proxy)
+	assert.EqualError(t, err, "unknown reporter type ")
 }

@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,10 +22,9 @@ import (
 	athrift "github.com/apache/thrift/lib/go/thrift"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/uber/jaeger-lib/metrics"
-	mTestutils "github.com/uber/jaeger-lib/metrics/testutils"
+	"github.com/uber/jaeger-lib/metrics/metricstest"
 
-	"github.com/jaegertracing/jaeger/cmd/agent/app/customtransports"
+	"github.com/jaegertracing/jaeger/cmd/agent/app/customtransport"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/servers/thriftudp"
 	"github.com/jaegertracing/jaeger/cmd/agent/app/testutils"
 	"github.com/jaegertracing/jaeger/thrift-gen/agent"
@@ -41,7 +41,7 @@ func TestTBufferedServer(t *testing.T) {
 }
 
 func testTBufferedServer(t *testing.T, queueSize int, testDroppedPackets bool) {
-	metricsFactory := metrics.NewLocalFactory(0)
+	metricsFactory := metricstest.NewFactory(0)
 
 	transport, err := thriftudp.NewTUDPServerTransport("127.0.0.1:0")
 	require.NoError(t, err)
@@ -100,12 +100,12 @@ func testTBufferedServer(t *testing.T, queueSize int, testDroppedPackets bool) {
 	assert.Equal(t, "span1", inMemReporter.ZipkinSpans()[0].Name)
 
 	// server must emit metrics
-	mTestutils.AssertCounterMetrics(t, metricsFactory,
-		mTestutils.ExpectedMetric{Name: "thrift.udp.server.packets.processed", Value: 1},
-		mTestutils.ExpectedMetric{Name: "thrift.udp.server.packets.dropped", Value: 0},
+	metricsFactory.AssertCounterMetrics(t,
+		metricstest.ExpectedMetric{Name: "thrift.udp.server.packets.processed", Value: 1},
+		metricstest.ExpectedMetric{Name: "thrift.udp.server.packets.dropped", Value: 0},
 	)
-	mTestutils.AssertGaugeMetrics(t, metricsFactory,
-		mTestutils.ExpectedMetric{Name: "thrift.udp.server.packet_size", Value: 38},
-		mTestutils.ExpectedMetric{Name: "thrift.udp.server.queue_size", Value: 0},
+	metricsFactory.AssertGaugeMetrics(t,
+		metricstest.ExpectedMetric{Name: "thrift.udp.server.packet_size", Value: 38},
+		metricstest.ExpectedMetric{Name: "thrift.udp.server.queue_size", Value: 0},
 	)
 }

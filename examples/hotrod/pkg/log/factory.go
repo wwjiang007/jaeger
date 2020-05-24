@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +36,7 @@ func NewFactory(logger *zap.Logger) Factory {
 
 // Bg creates a context-unaware logger.
 func (b Factory) Bg() Logger {
-	return logger{logger: b.logger}
+	return logger(b)
 }
 
 // For returns a context-aware Logger. If the context

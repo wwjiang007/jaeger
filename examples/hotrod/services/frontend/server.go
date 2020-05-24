@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,15 +18,14 @@ package frontend
 import (
 	"encoding/json"
 	"net/http"
+	"path"
 
 	"github.com/opentracing/opentracing-go"
-	"github.com/rakyll/statik/fs"
 	"go.uber.org/zap"
 
 	"github.com/jaegertracing/jaeger/examples/hotrod/pkg/httperr"
 	"github.com/jaegertracing/jaeger/examples/hotrod/pkg/log"
 	"github.com/jaegertracing/jaeger/examples/hotrod/pkg/tracing"
-	_ "github.com/jaegertracing/jaeger/examples/hotrod/services/frontend/statik" // init static assets
 )
 
 // Server implements jaeger-demo-frontend service
@@ -35,6 +35,7 @@ type Server struct {
 	logger   log.Factory
 	bestETA  *bestETA
 	assetFS  http.FileSystem
+	basepath string
 }
 
 // ConfigOptions used to make sure service clients
@@ -44,34 +45,34 @@ type ConfigOptions struct {
 	DriverHostPort   string
 	CustomerHostPort string
 	RouteHostPort    string
+	Basepath         string
 }
 
 // NewServer creates a new frontend.Server
 func NewServer(options ConfigOptions, tracer opentracing.Tracer, logger log.Factory) *Server {
-	assetFS, err := fs.New()
-	if err != nil {
-		logger.Bg().Fatal("cannot import web assets", zap.Error(err))
-	}
+	assetFS := FS(false)
 	return &Server{
 		hostPort: options.FrontendHostPort,
 		tracer:   tracer,
 		logger:   logger,
 		bestETA:  newBestETA(tracer, logger, options),
 		assetFS:  assetFS,
+		basepath: options.Basepath,
 	}
 }
 
 // Run starts the frontend server
 func (s *Server) Run() error {
 	mux := s.createServeMux()
-	s.logger.Bg().Info("Starting", zap.String("address", "http://"+s.hostPort))
+	s.logger.Bg().Info("Starting", zap.String("address", "http://"+path.Join(s.hostPort, s.basepath)))
 	return http.ListenAndServe(s.hostPort, mux)
 }
 
 func (s *Server) createServeMux() http.Handler {
 	mux := tracing.NewServeMux(s.tracer)
-	mux.Handle("/", http.FileServer(s.assetFS))
-	mux.Handle("/dispatch", http.HandlerFunc(s.dispatch))
+	p := path.Join("/", s.basepath)
+	mux.Handle(p, http.StripPrefix(p, http.FileServer(s.assetFS)))
+	mux.Handle(path.Join(p, "/dispatch"), http.HandlerFunc(s.dispatch))
 	return mux
 }
 

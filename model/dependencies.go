@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,9 +15,15 @@
 
 package model
 
-// DependencyLink shows dependencies between services
-type DependencyLink struct {
-	Parent    string `json:"parent"`
-	Child     string `json:"child"`
-	CallCount uint64 `json:"callCount"`
+const (
+	// JaegerDependencyLinkSource describes a dependency diagram that was generated from Jaeger traces.
+	JaegerDependencyLinkSource = "jaeger"
+)
+
+// ApplyDefaults applies defaults to the DependencyLink.
+func (d DependencyLink) ApplyDefaults() DependencyLink {
+	if d.Source == "" {
+		d.Source = JaegerDependencyLinkSource
+	}
+	return d
 }

@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,10 +37,9 @@ var customerCmd = &cobra.Command{
 		logger := log.NewFactory(zapLogger)
 		server := customer.NewServer(
 			net.JoinHostPort("0.0.0.0", strconv.Itoa(customerPort)),
-			tracing.Init("customer", metricsFactory.Namespace("customer", nil), logger, jAgentHostPort),
+			tracing.Init("customer", metricsFactory, logger),
 			metricsFactory,
 			logger,
-			jAgentHostPort,
 		)
 		return logError(zapLogger, server.Run())
 	},

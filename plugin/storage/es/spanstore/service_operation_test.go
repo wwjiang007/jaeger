@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,13 +19,14 @@ import (
 	"context"
 	"testing"
 
+	"github.com/olivere/elastic"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/olivere/elastic.v5"
 
 	"github.com/jaegertracing/jaeger/pkg/es/mocks"
 	"github.com/jaegertracing/jaeger/plugin/storage/es/spanstore/dbmodel"
+	"github.com/jaegertracing/jaeger/storage/spanstore"
 )
 
 func TestWriteService(t *testing.T) {
@@ -37,7 +39,7 @@ func TestWriteService(t *testing.T) {
 		indexService.On("Index", stringMatcher(indexName)).Return(indexService)
 		indexService.On("Type", stringMatcher(serviceType)).Return(indexService)
 		indexService.On("Id", stringMatcher(serviceHash)).Return(indexService)
-		indexService.On("BodyJson", mock.AnythingOfType("spanstore.Service")).Return(indexService)
+		indexService.On("BodyJson", mock.AnythingOfType("dbmodel.Service")).Return(indexService)
 		indexService.On("Add")
 
 		w.client.On("Index").Return(indexService)
@@ -72,7 +74,7 @@ func TestWriteServiceError(t *testing.T) {
 		indexService.On("Index", stringMatcher(indexName)).Return(indexService)
 		indexService.On("Type", stringMatcher(serviceType)).Return(indexService)
 		indexService.On("Id", stringMatcher(serviceHash)).Return(indexService)
-		indexService.On("BodyJson", mock.AnythingOfType("spanstore.Service")).Return(indexService)
+		indexService.On("BodyJson", mock.AnythingOfType("dbmodel.Service")).Return(indexService)
 		indexService.On("Add")
 
 		w.client.On("Index").Return(indexService)
@@ -120,7 +122,10 @@ func TestSpanReader_GetOperationsEmptyIndex(t *testing.T) {
 			Return(&elastic.MultiSearchResult{
 				Responses: []*elastic.SearchResult{},
 			}, nil)
-		services, err := r.reader.GetOperations(context.Background(), "foo")
+		services, err := r.reader.GetOperations(
+			context.Background(),
+			spanstore.OperationQueryParameters{ServiceName: "foo"},
+		)
 		require.NoError(t, err)
 		assert.Empty(t, services)
 	})

@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +29,7 @@ import (
 type ReadMetricsDecorator struct {
 	spanReader           spanstore.Reader
 	findTracesMetrics    *queryMetrics
+	findTraceIDsMetrics  *queryMetrics
 	getTraceMetrics      *queryMetrics
 	getServicesMetrics   *queryMetrics
 	getOperationsMetrics *queryMetrics
@@ -36,7 +38,7 @@ type ReadMetricsDecorator struct {
 type queryMetrics struct {
 	Errors     metrics.Counter `metric:"requests" tags:"result=err"`
 	Successes  metrics.Counter `metric:"requests" tags:"result=ok"`
-	Responses  metrics.Timer   `metric:"responses"` //used as a histogram, not necessary for GetTrace
+	Responses  metrics.Timer   `metric:"responses"` // used as a histogram, not necessary for GetTrace
 	ErrLatency metrics.Timer   `metric:"latency" tags:"result=err"`
 	OKLatency  metrics.Timer   `metric:"latency" tags:"result=ok"`
 }
@@ -57,6 +59,7 @@ func NewReadMetricsDecorator(spanReader spanstore.Reader, metricsFactory metrics
 	return &ReadMetricsDecorator{
 		spanReader:           spanReader,
 		findTracesMetrics:    buildQueryMetrics("find_traces", metricsFactory),
+		findTraceIDsMetrics:  buildQueryMetrics("find_trace_ids", metricsFactory),
 		getTraceMetrics:      buildQueryMetrics("get_trace", metricsFactory),
 		getServicesMetrics:   buildQueryMetrics("get_services", metricsFactory),
 		getOperationsMetrics: buildQueryMetrics("get_operations", metricsFactory),
@@ -65,7 +68,7 @@ func NewReadMetricsDecorator(spanReader spanstore.Reader, metricsFactory metrics
 
 func buildQueryMetrics(operation string, metricsFactory metrics.Factory) *queryMetrics {
 	qMetrics := &queryMetrics{}
-	scoped := metricsFactory.Namespace("", map[string]string{"operation": operation})
+	scoped := metricsFactory.Namespace(metrics.NSOptions{Name: "", Tags: map[string]string{"operation": operation}})
 	metrics.Init(qMetrics, scoped, nil)
 	return qMetrics
 }
@@ -75,6 +78,14 @@ func (m *ReadMetricsDecorator) FindTraces(ctx context.Context, traceQuery *spans
 	start := time.Now()
 	retMe, err := m.spanReader.FindTraces(ctx, traceQuery)
 	m.findTracesMetrics.emit(err, time.Since(start), len(retMe))
+	return retMe, err
+}
+
+// FindTraceIDs implements spanstore.Reader#FindTraceIDs
+func (m *ReadMetricsDecorator) FindTraceIDs(ctx context.Context, traceQuery *spanstore.TraceQueryParameters) ([]model.TraceID, error) {
+	start := time.Now()
+	retMe, err := m.spanReader.FindTraceIDs(ctx, traceQuery)
+	m.findTraceIDsMetrics.emit(err, time.Since(start), len(retMe))
 	return retMe, err
 }
 
@@ -95,9 +106,12 @@ func (m *ReadMetricsDecorator) GetServices(ctx context.Context) ([]string, error
 }
 
 // GetOperations implements spanstore.Reader#GetOperations
-func (m *ReadMetricsDecorator) GetOperations(ctx context.Context, service string) ([]string, error) {
+func (m *ReadMetricsDecorator) GetOperations(
+	ctx context.Context,
+	query spanstore.OperationQueryParameters,
+) ([]spanstore.Operation, error) {
 	start := time.Now()
-	retMe, err := m.spanReader.GetOperations(ctx, service)
+	retMe, err := m.spanReader.GetOperations(ctx, query)
 	m.getOperationsMetrics.emit(err, time.Since(start), len(retMe))
 	return retMe, err
 }

@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,10 +37,9 @@ var driverCmd = &cobra.Command{
 		logger := log.NewFactory(zapLogger)
 		server := driver.NewServer(
 			net.JoinHostPort("0.0.0.0", strconv.Itoa(driverPort)),
-			tracing.Init("driver", metricsFactory.Namespace("driver", nil), logger, jAgentHostPort),
+			tracing.Init("driver", metricsFactory, logger),
 			metricsFactory,
 			logger,
-			jAgentHostPort,
 		)
 		return logError(zapLogger, server.Run())
 	},

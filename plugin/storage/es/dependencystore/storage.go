@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,14 +18,16 @@ package dependencystore
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/olivere/elastic"
 	"go.uber.org/zap"
-	"gopkg.in/olivere/elastic.v5"
 
 	"github.com/jaegertracing/jaeger/model"
 	"github.com/jaegertracing/jaeger/pkg/es"
+	"github.com/jaegertracing/jaeger/plugin/storage/es/dependencystore/dbmodel"
 )
 
 const (
@@ -32,35 +35,31 @@ const (
 	dependencyIndex = "jaeger-dependencies-"
 )
 
-type timeToDependencies struct {
-	Timestamp    time.Time              `json:"timestamp"`
-	Dependencies []model.DependencyLink `json:"dependencies"`
-}
-
 // DependencyStore handles all queries and insertions to ElasticSearch dependencies
 type DependencyStore struct {
-	ctx                   context.Context
-	client                es.Client
-	logger                *zap.Logger
-	dependencyIndexPrefix string
+	ctx         context.Context
+	client      es.Client
+	logger      *zap.Logger
+	indexPrefix string
 }
 
 // NewDependencyStore returns a DependencyStore
 func NewDependencyStore(client es.Client, logger *zap.Logger, indexPrefix string) *DependencyStore {
+	var prefix string
 	if indexPrefix != "" {
-		indexPrefix += ":"
+		prefix = indexPrefix + "-"
 	}
 	return &DependencyStore{
-		ctx:                   context.Background(),
-		client:                client,
-		logger:                logger,
-		dependencyIndexPrefix: indexPrefix + dependencyIndex,
+		ctx:         context.Background(),
+		client:      client,
+		logger:      logger,
+		indexPrefix: prefix + dependencyIndex,
 	}
 }
 
 // WriteDependencies implements dependencystore.Writer#WriteDependencies.
 func (s *DependencyStore) WriteDependencies(ts time.Time, dependencies []model.DependencyLink) error {
-	indexName := indexWithDate(s.dependencyIndexPrefix, ts)
+	indexName := indexWithDate(s.indexPrefix, ts)
 	if err := s.createIndex(indexName); err != nil {
 		return err
 	}
@@ -69,43 +68,43 @@ func (s *DependencyStore) WriteDependencies(ts time.Time, dependencies []model.D
 }
 
 func (s *DependencyStore) createIndex(indexName string) error {
-	_, err := s.client.CreateIndex(indexName).Body(dependenciesMapping).Do(s.ctx)
+	_, err := s.client.CreateIndex(indexName).Body(getMapping(s.client.GetVersion())).Do(s.ctx)
 	if err != nil {
-		return errors.Wrap(err, "Failed to create index")
+		return fmt.Errorf("failed to create index: %w", err)
 	}
 	return nil
 }
 
 func (s *DependencyStore) writeDependencies(indexName string, ts time.Time, dependencies []model.DependencyLink) {
 	s.client.Index().Index(indexName).Type(dependencyType).
-		BodyJson(&timeToDependencies{Timestamp: ts,
-			Dependencies: dependencies,
+		BodyJson(&dbmodel.TimeDependencies{Timestamp: ts,
+			Dependencies: dbmodel.FromDomainDependencies(dependencies),
 		}).Add()
 }
 
 // GetDependencies returns all interservice dependencies
 func (s *DependencyStore) GetDependencies(endTs time.Time, lookback time.Duration) ([]model.DependencyLink, error) {
-	searchResult, err := s.client.Search(getIndices(s.dependencyIndexPrefix, endTs, lookback)...).
-		Type(dependencyType).
+	indices := getIndices(s.indexPrefix, endTs, lookback)
+	searchResult, err := s.client.Search(indices...).
 		Size(10000). // the default elasticsearch allowed limit
 		Query(buildTSQuery(endTs, lookback)).
 		IgnoreUnavailable(true).
 		Do(s.ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "Failed to search for dependencies")
+		return nil, fmt.Errorf("failed to search for dependencies: %w", err)
 	}
 
-	var retDependencies []model.DependencyLink
+	var retDependencies []dbmodel.DependencyLink
 	hits := searchResult.Hits.Hits
 	for _, hit := range hits {
 		source := hit.Source
-		var tToD timeToDependencies
+		var tToD dbmodel.TimeDependencies
 		if err := json.Unmarshal(*source, &tToD); err != nil {
-			return nil, errors.New("Unmarshalling ElasticSearch documents failed")
+			return nil, errors.New("unmarshalling ElasticSearch documents failed")
 		}
 		retDependencies = append(retDependencies, tToD.Dependencies...)
 	}
-	return retDependencies, nil
+	return dbmodel.ToDomainDependencies(retDependencies), nil
 }
 
 func buildTSQuery(endTs time.Time, lookback time.Duration) elastic.Query {

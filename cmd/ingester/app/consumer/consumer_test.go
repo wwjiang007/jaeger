@@ -15,6 +15,7 @@
 package consumer
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -22,13 +23,12 @@ import (
 
 	"github.com/Shopify/sarama"
 	smocks "github.com/Shopify/sarama/mocks"
-	"github.com/bsm/sarama-cluster"
-	"github.com/pkg/errors"
+	cluster "github.com/bsm/sarama-cluster"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/uber/jaeger-lib/metrics"
-	"github.com/uber/jaeger-lib/metrics/testutils"
+	"github.com/uber/jaeger-lib/metrics/metricstest"
 	"go.uber.org/zap"
 
 	kmocks "github.com/jaegertracing/jaeger/cmd/ingester/app/consumer/mocks"
@@ -47,7 +47,7 @@ const (
 )
 
 func TestConstructor(t *testing.T) {
-	newConsumer, err := New(Params{})
+	newConsumer, err := New(Params{MetricsFactory: metrics.NullFactory})
 	assert.NoError(t, err)
 	assert.NotNil(t, newConsumer)
 }
@@ -83,22 +83,24 @@ func newSaramaClusterConsumer(saramaPartitionConsumer sarama.PartitionConsumer) 
 }
 
 func newConsumer(
-	factory metrics.Factory,
+	metricsFactory metrics.Factory,
 	topic string,
 	processor processor.SpanProcessor,
 	consumer consumer.Consumer) *Consumer {
 
 	logger, _ := zap.NewDevelopment()
 	return &Consumer{
-		metricsFactory:     factory,
-		logger:             logger,
-		internalConsumer:   consumer,
-		partitionIDToState: make(map[int32]*consumerState),
+		metricsFactory:      metricsFactory,
+		logger:              logger,
+		internalConsumer:    consumer,
+		partitionIDToState:  make(map[int32]*consumerState),
+		partitionsHeldGauge: partitionsHeldGauge(metricsFactory),
+		deadlockDetector:    newDeadlockDetector(metricsFactory, logger, time.Second),
 
 		processorFactory: ProcessorFactory{
 			topic:          topic,
 			consumer:       consumer,
-			metricsFactory: factory,
+			metricsFactory: metricsFactory,
 			logger:         logger,
 			baseProcessor:  processor,
 			parallelism:    1,
@@ -115,14 +117,14 @@ func TestSaramaConsumerWrapper_MarkPartitionOffset(t *testing.T) {
 }
 
 func TestSaramaConsumerWrapper_start_Messages(t *testing.T) {
-	localFactory := metrics.NewLocalFactory(0)
+	localFactory := metricstest.NewFactory(0)
 
 	msg := &sarama.ConsumerMessage{}
 
 	isProcessed := sync.WaitGroup{}
 	isProcessed.Add(1)
 	mp := &pmocks.SpanProcessor{}
-	mp.On("Process", &saramaMessageWrapper{msg}).Return(func(msg processor.Message) error {
+	mp.On("Process", saramaMessageWrapper{msg}).Return(func(msg processor.Message) error {
 		isProcessed.Done()
 		return nil
 	})
@@ -151,32 +153,47 @@ func TestSaramaConsumerWrapper_start_Messages(t *testing.T) {
 	mc.YieldMessage(msg)
 	isProcessed.Wait()
 
+	localFactory.AssertGaugeMetrics(t, metricstest.ExpectedMetric{
+		Name:  "sarama-consumer.partitions-held",
+		Value: 1,
+	})
+
 	mp.AssertExpectations(t)
 	// Ensure that the partition consumer was updated in the map
 	assert.Equal(t, saramaPartitionConsumer.HighWaterMarkOffset(),
 		undertest.partitionIDToState[partition].partitionConsumer.HighWaterMarkOffset())
 	undertest.Close()
 
+	localFactory.AssertCounterMetrics(t, metricstest.ExpectedMetric{
+		Name:  "sarama-consumer.partitions-held",
+		Value: 0,
+	})
+
 	partitionTag := map[string]string{"partition": fmt.Sprint(partition)}
-	testutils.AssertCounterMetrics(t, localFactory, testutils.ExpectedMetric{
+	localFactory.AssertCounterMetrics(t, metricstest.ExpectedMetric{
 		Name:  "sarama-consumer.messages",
 		Tags:  partitionTag,
 		Value: 1,
 	})
-	testutils.AssertGaugeMetrics(t, localFactory, testutils.ExpectedMetric{
+	localFactory.AssertGaugeMetrics(t, metricstest.ExpectedMetric{
 		Name:  "sarama-consumer.current-offset",
 		Tags:  partitionTag,
 		Value: 1,
 	})
-	testutils.AssertGaugeMetrics(t, localFactory, testutils.ExpectedMetric{
+	localFactory.AssertGaugeMetrics(t, metricstest.ExpectedMetric{
 		Name:  "sarama-consumer.offset-lag",
 		Tags:  partitionTag,
 		Value: 0,
 	})
+	localFactory.AssertCounterMetrics(t, metricstest.ExpectedMetric{
+		Name:  "sarama-consumer.partition-start",
+		Tags:  partitionTag,
+		Value: 1,
+	})
 }
 
 func TestSaramaConsumerWrapper_start_Errors(t *testing.T) {
-	localFactory := metrics.NewLocalFactory(0)
+	localFactory := metricstest.NewFactory(0)
 
 	saramaConsumer := smocks.NewConsumer(t, &sarama.Config{})
 	mc := saramaConsumer.ExpectConsumePartition(topic, partition, msgOffset)
@@ -199,7 +216,7 @@ func TestSaramaConsumerWrapper_start_Errors(t *testing.T) {
 		}
 
 		partitionTag := map[string]string{"partition": fmt.Sprint(partition)}
-		testutils.AssertCounterMetrics(t, localFactory, testutils.ExpectedMetric{
+		localFactory.AssertCounterMetrics(t, metricstest.ExpectedMetric{
 			Name:  "sarama-consumer.errors",
 			Tags:  partitionTag,
 			Value: 1,
@@ -209,4 +226,30 @@ func TestSaramaConsumerWrapper_start_Errors(t *testing.T) {
 	}
 
 	t.Fail()
+}
+
+func TestHandleClosePartition(t *testing.T) {
+	metricsFactory := metricstest.NewFactory(0)
+
+	mp := &pmocks.SpanProcessor{}
+	saramaConsumer := smocks.NewConsumer(t, &sarama.Config{})
+	mc := saramaConsumer.ExpectConsumePartition(topic, partition, msgOffset)
+	mc.ExpectErrorsDrainedOnClose()
+	saramaPartitionConsumer, e := saramaConsumer.ConsumePartition(topic, partition, msgOffset)
+	require.NoError(t, e)
+
+	undertest := newConsumer(metricsFactory, topic, mp, newSaramaClusterConsumer(saramaPartitionConsumer))
+	undertest.deadlockDetector = newDeadlockDetector(metricsFactory, undertest.logger, 200*time.Millisecond)
+	undertest.Start()
+	defer undertest.Close()
+
+	for i := 0; i < 10; i++ {
+		undertest.deadlockDetector.allPartitionsDeadlockDetector.incrementMsgCount() // Don't trigger panic on all partitions detector
+		time.Sleep(100 * time.Millisecond)
+		c, _ := metricsFactory.Snapshot()
+		if c["sarama-consumer.partition-close|partition=316"] == 1 {
+			return
+		}
+	}
+	assert.Fail(t, "Did not close partition")
 }

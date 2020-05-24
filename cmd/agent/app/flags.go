@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,9 +18,11 @@ package app
 import (
 	"flag"
 	"fmt"
-	"strings"
+	"strconv"
 
 	"github.com/spf13/viper"
+
+	"github.com/jaegertracing/jaeger/ports"
 )
 
 const (
@@ -27,68 +30,61 @@ const (
 	suffixServerQueueSize     = "server-queue-size"
 	suffixServerMaxPacketSize = "server-max-packet-size"
 	suffixServerHostPort      = "server-host-port"
-	collectorHostPort         = "collector.host-port"
-	httpServerHostPort        = "http-server.host-port"
-	discoveryMinPeers         = "discovery.min-peers"
-	discoveryConnCheckTimeout = "discovery.conn-check-timeout"
+	// HTTPServerHostPort is the flag for HTTP endpoint
+	HTTPServerHostPort = "http-server.host-port"
 )
 
 var defaultProcessors = []struct {
 	model    Model
 	protocol Protocol
-	hostPort string
+	port     int
 }{
-	{model: "zipkin", protocol: "compact", hostPort: ":5775"},
-	{model: "jaeger", protocol: "compact", hostPort: ":6831"},
-	{model: "jaeger", protocol: "binary", hostPort: ":6832"},
+	{model: "zipkin", protocol: "compact", port: ports.AgentZipkinThriftCompactUDP},
+	{model: "jaeger", protocol: "compact", port: ports.AgentJaegerThriftCompactUDP},
+	{model: "jaeger", protocol: "binary", port: ports.AgentJaegerThriftBinaryUDP},
 }
 
 // AddFlags adds flags for Builder.
 func AddFlags(flags *flag.FlagSet) {
-	for _, processor := range defaultProcessors {
-		prefix := fmt.Sprintf("processor.%s-%s.", processor.model, processor.protocol)
+	for _, p := range defaultProcessors {
+		prefix := fmt.Sprintf("processor.%s-%s.", p.model, p.protocol)
 		flags.Int(prefix+suffixWorkers, defaultServerWorkers, "how many workers the processor should run")
 		flags.Int(prefix+suffixServerQueueSize, defaultQueueSize, "length of the queue for the UDP server")
 		flags.Int(prefix+suffixServerMaxPacketSize, defaultMaxPacketSize, "max packet size for the UDP server")
-		flags.String(prefix+suffixServerHostPort, processor.hostPort, "host:port for the UDP server")
+		flags.String(prefix+suffixServerHostPort, ":"+strconv.Itoa(p.port), "host:port for the UDP server")
 	}
+	AddOTELFlags(flags)
+}
+
+// AddOTELFlags adds flags that are exposed by OTEL collector
+func AddOTELFlags(flags *flag.FlagSet) {
 	flags.String(
-		collectorHostPort,
-		"",
-		"comma-separated string representing host:ports of a static list of collectors to connect to directly (e.g. when not using service discovery)")
-	flags.String(
-		httpServerHostPort,
+		HTTPServerHostPort,
 		defaultHTTPServerHostPort,
-		"host:port of the http server (e.g. for /sampling point and /baggage endpoint)")
-	flags.Int(
-		discoveryMinPeers,
-		defaultMinPeers,
-		"if using service discovery, the min number of connections to maintain to the backend")
-	flags.Duration(
-		discoveryConnCheckTimeout,
-		defaultConnCheckTimeout,
-		"sets the timeout used when establishing new connections")
+		"host:port of the http server (e.g. for /sampling point and /baggageRestrictions endpoint)")
 }
 
 // InitFromViper initializes Builder with properties retrieved from Viper.
 func (b *Builder) InitFromViper(v *viper.Viper) *Builder {
-	b.Metrics.InitFromViper(v)
-
 	for _, processor := range defaultProcessors {
 		prefix := fmt.Sprintf("processor.%s-%s.", processor.model, processor.protocol)
 		p := &ProcessorConfiguration{Model: processor.model, Protocol: processor.protocol}
 		p.Workers = v.GetInt(prefix + suffixWorkers)
 		p.Server.QueueSize = v.GetInt(prefix + suffixServerQueueSize)
 		p.Server.MaxPacketSize = v.GetInt(prefix + suffixServerMaxPacketSize)
-		p.Server.HostPort = v.GetString(prefix + suffixServerHostPort)
+		p.Server.HostPort = portNumToHostPort(v.GetString(prefix + suffixServerHostPort))
 		b.Processors = append(b.Processors, *p)
 	}
 
-	if len(v.GetString(collectorHostPort)) > 0 {
-		b.CollectorHostPorts = strings.Split(v.GetString(collectorHostPort), ",")
-	}
-	b.HTTPServer.HostPort = v.GetString(httpServerHostPort)
-	b.DiscoveryMinPeers = v.GetInt(discoveryMinPeers)
-	b.ConnCheckTimeout = v.GetDuration(discoveryConnCheckTimeout)
+	b.HTTPServer.HostPort = portNumToHostPort(v.GetString(HTTPServerHostPort))
 	return b
+}
+
+// portNumToHostPort checks if the value is a raw integer port number,
+// and converts it to ":{port}" host-port string, otherwise leaves it as is.
+func portNumToHostPort(v string) string {
+	if _, err := strconv.Atoi(v); err == nil {
+		return ":" + v
+	}
+	return v
 }

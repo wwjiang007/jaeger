@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,11 +17,11 @@ package spanstore
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/pkg/errors"
 	"github.com/uber/jaeger-lib/metrics"
 	"go.uber.org/zap"
 
@@ -36,10 +37,6 @@ const (
 		INTO traces(trace_id, span_id, span_hash, parent_id, operation_name, flags,
 				    start_time, duration, tags, logs, refs, process)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	insertTag = `
-		INSERT
-		INTO tag_index(trace_id, span_id, service_name, start_time, tag_key, tag_value)
-		VALUES (?, ?, ?, ?, ?, ?)`
 
 	serviceNameIndex = `
 		INSERT
@@ -51,6 +48,11 @@ const (
 		INTO
 		service_operation_index(service_name, operation_name, start_time, trace_id)
 		VALUES (?, ?, ?, ?)`
+
+	tagIndex = `
+		INSERT
+		INTO tag_index(trace_id, span_id, service_name, start_time, tag_key, tag_value)
+		VALUES (?, ?, ?, ?, ?, ?)`
 
 	durationIndex = `
 		INSERT
@@ -72,7 +74,7 @@ const (
 
 type storageMode uint8
 type serviceNamesWriter func(serviceName string) error
-type operationNamesWriter func(serviceName, operationName string) error
+type operationNamesWriter func(operation dbmodel.Operation) error
 
 type spanWriterMetrics struct {
 	traces                *casMetrics.Table
@@ -105,7 +107,7 @@ func NewSpanWriter(
 ) *SpanWriter {
 	serviceNamesStorage := NewServiceNamesStorage(session, writeCacheTTL, metricsFactory, logger)
 	operationNamesStorage := NewOperationNamesStorage(session, writeCacheTTL, metricsFactory, logger)
-	tagIndexSkipped := metricsFactory.Counter("tag_index_skipped", nil)
+	tagIndexSkipped := metricsFactory.Counter(metrics.Options{Name: "tag_index_skipped", Tags: nil})
 	opts := applyOptions(options...)
 	return &SpanWriter{
 		session:              session,
@@ -171,13 +173,14 @@ func (s *SpanWriter) writeSpan(span *model.Span, ds *dbmodel.Span) error {
 }
 
 func (s *SpanWriter) writeIndexes(span *model.Span, ds *dbmodel.Span) error {
-	if err := s.saveServiceNameAndOperationName(ds.ServiceName, ds.OperationName); err != nil {
+	spanKind, _ := span.GetSpanKind()
+	if err := s.saveServiceNameAndOperationName(dbmodel.Operation{
+		ServiceName:   ds.ServiceName,
+		SpanKind:      spanKind,
+		OperationName: ds.OperationName,
+	}); err != nil {
 		// should this be a soft failure?
 		return s.logError(ds, err, "Failed to insert service name and operation name", s.logger)
-	}
-
-	if err := s.indexByTags(span, ds); err != nil {
-		return s.logError(ds, err, "Failed to index tags", s.logger)
 	}
 
 	if s.indexFilter(ds, dbmodel.ServiceIndex) {
@@ -190,6 +193,14 @@ func (s *SpanWriter) writeIndexes(span *model.Span, ds *dbmodel.Span) error {
 		if err := s.indexByOperation(ds); err != nil {
 			return s.logError(ds, err, "Failed to index operation name", s.logger)
 		}
+	}
+
+	if span.Flags.IsFirehoseEnabled() {
+		return nil // skipping expensive indexing
+	}
+
+	if err := s.indexByTags(span, ds); err != nil {
+		return s.logError(ds, err, "Failed to index tags", s.logger)
 	}
 
 	if s.indexFilter(ds, dbmodel.DurationIndex) {
@@ -205,7 +216,7 @@ func (s *SpanWriter) indexByTags(span *model.Span, ds *dbmodel.Span) error {
 		// we should introduce retries or just ignore failures imo, retrying each individual tag insertion might be better
 		// we should consider bucketing.
 		if s.shouldIndexTag(v) {
-			insertTagQuery := s.session.Query(insertTag, ds.TraceID, ds.SpanID, v.ServiceName, ds.StartTime, v.TagKey, v.TagValue)
+			insertTagQuery := s.session.Query(tagIndex, ds.TraceID, ds.SpanID, v.ServiceName, ds.StartTime, v.TagKey, v.TagValue)
 			if err := s.writerMetrics.tagIndex.Exec(insertTagQuery, s.logger); err != nil {
 				withTagInfo := s.logger.
 					With(zap.String("tag_key", v.TagKey)).
@@ -252,7 +263,7 @@ func (s *SpanWriter) indexByOperation(span *dbmodel.Span) error {
 // shouldIndexTag checks to see if the tag is json or not, if it's UTF8 valid and it's not too large
 func (s *SpanWriter) shouldIndexTag(tag dbmodel.TagInsertion) bool {
 	isJSON := func(s string) bool {
-		var js map[string]interface{}
+		var js json.RawMessage
 		// poor man's string-is-a-json check shortcircuits full unmarshalling
 		return strings.HasPrefix(s, "{") && json.Unmarshal([]byte(s), &js) == nil
 	}
@@ -270,12 +281,12 @@ func (s *SpanWriter) logError(span *dbmodel.Span, err error, msg string, logger 
 		With(zap.Int64("span_id", span.SpanID)).
 		With(zap.Error(err)).
 		Error(msg)
-	return errors.Wrap(err, msg)
+	return fmt.Errorf("%s: %w", msg, err)
 }
 
-func (s *SpanWriter) saveServiceNameAndOperationName(serviceName, operationName string) error {
-	if err := s.serviceNamesWriter(serviceName); err != nil {
+func (s *SpanWriter) saveServiceNameAndOperationName(operation dbmodel.Operation) error {
+	if err := s.serviceNamesWriter(operation.ServiceName); err != nil {
 		return err
 	}
-	return s.operationNamesWriter(serviceName, operationName)
+	return s.operationNamesWriter(operation)
 }

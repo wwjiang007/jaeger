@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +20,7 @@ import (
 )
 
 // NewProcess creates a new Process for given serviceName and tags.
-// The tags are sorted in place and kept in the the same array/slice,
+// The tags are sorted in place and kept in the same array/slice,
 // in order to store the Process in a canonical form that is relied
 // upon by the Equal and Hash functions.
 func NewProcess(serviceName string, tags []KeyValue) *Process {

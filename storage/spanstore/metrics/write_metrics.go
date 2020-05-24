@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,7 +33,7 @@ type WriteMetrics struct {
 // NewWriteMetrics takes a metrics scope and creates a metrics struct
 func NewWriteMetrics(factory metrics.Factory, tableName string) *WriteMetrics {
 	t := &WriteMetrics{}
-	metrics.Init(t, factory.Namespace(tableName, nil), nil)
+	metrics.Init(t, factory.Namespace(metrics.NSOptions{Name: tableName, Tags: nil}), nil)
 	return t
 }
 

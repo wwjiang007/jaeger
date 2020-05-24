@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +16,7 @@
 package testutils
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 
@@ -65,4 +67,28 @@ func TestRaceCondition(t *testing.T) {
 
 	close(start)
 	finish.Wait()
+}
+
+func TestLogMatcher(t *testing.T) {
+	tests := []struct {
+		occurrences int
+		subStr      string
+		logs        []string
+		expected    bool
+		errMsg      string
+	}{
+		{occurrences: 1, expected: false, errMsg: "subStr '' does not occur 1 time(s) in []"},
+		{occurrences: 1, subStr: "hi", logs: []string{"hi"}, expected: true},
+		{occurrences: 3, subStr: "hi", logs: []string{"hi", "hi"}, expected: false, errMsg: "subStr 'hi' does not occur 3 time(s) in [hi hi]"},
+		{occurrences: 3, subStr: "hi", logs: []string{"hi", "hi", "hi"}, expected: true},
+		{occurrences: 1, subStr: "hi", logs: []string{"bye", "bye"}, expected: false, errMsg: "subStr 'hi' does not occur 1 time(s) in [bye bye]"},
+	}
+	for i, tt := range tests {
+		test := tt
+		t.Run(fmt.Sprintf("%v", i), func(t *testing.T) {
+			match, errMsg := LogMatcher(test.occurrences, test.subStr, test.logs)
+			assert.Equal(t, test.expected, match)
+			assert.Equal(t, test.errMsg, errMsg)
+		})
+	}
 }

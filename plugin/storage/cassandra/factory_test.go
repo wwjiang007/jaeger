@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/uber/jaeger-lib/metrics"
 	"go.uber.org/zap"
 
@@ -33,30 +35,41 @@ var _ storage.Factory = new(Factory)
 var _ storage.ArchiveFactory = new(Factory)
 
 type mockSessionBuilder struct {
-	err error
+	session *mocks.Session
+	err     error
+}
+
+func newMockSessionBuilder(session *mocks.Session, err error) *mockSessionBuilder {
+	return &mockSessionBuilder{
+		session: session,
+		err:     err,
+	}
 }
 
 func (m *mockSessionBuilder) NewSession() (cassandra.Session, error) {
-	if m.err == nil {
-		return &mocks.Session{}, nil
-	}
-	return nil, m.err
+	return m.session, m.err
 }
 
 func TestCassandraFactory(t *testing.T) {
 	logger, logBuf := testutils.NewLogger()
 	f := NewFactory()
 	v, command := config.Viperize(f.AddFlags)
-	command.ParseFlags([]string{"--cassandra-archive.enabled=true"})
+	command.ParseFlags([]string{"--cassandra-archive.enabled=true", "--cassandra.enable-dependencies-v2=true"})
 	f.InitFromViper(v)
 
 	// after InitFromViper, f.primaryConfig points to a real session builder that will fail in unit tests,
 	// so we override it with a mock.
-	f.primaryConfig = &mockSessionBuilder{err: errors.New("made-up error")}
+	f.primaryConfig = newMockSessionBuilder(nil, errors.New("made-up error"))
 	assert.EqualError(t, f.Initialize(metrics.NullFactory, zap.NewNop()), "made-up error")
 
-	f.primaryConfig = &mockSessionBuilder{}
-	f.archiveConfig = &mockSessionBuilder{err: errors.New("made-up error")}
+	var (
+		session = &mocks.Session{}
+		query   = &mocks.Query{}
+	)
+	session.On("Query", mock.AnythingOfType("string"), mock.Anything).Return(query)
+	query.On("Exec").Return(nil)
+	f.primaryConfig = newMockSessionBuilder(session, nil)
+	f.archiveConfig = newMockSessionBuilder(nil, errors.New("made-up error"))
 	assert.EqualError(t, f.Initialize(metrics.NullFactory, zap.NewNop()), "made-up error")
 
 	f.archiveConfig = nil
@@ -73,12 +86,12 @@ func TestCassandraFactory(t *testing.T) {
 	assert.NoError(t, err)
 
 	_, err = f.CreateArchiveSpanReader()
-	assert.EqualError(t, err, "Archive storage not configured")
+	assert.EqualError(t, err, "archive storage not configured")
 
 	_, err = f.CreateArchiveSpanWriter()
-	assert.EqualError(t, err, "Archive storage not configured")
+	assert.EqualError(t, err, "archive storage not configured")
 
-	f.archiveConfig = &mockSessionBuilder{}
+	f.archiveConfig = newMockSessionBuilder(session, nil)
 	assert.NoError(t, f.Initialize(metrics.NullFactory, zap.NewNop()))
 
 	_, err = f.CreateArchiveSpanReader()
@@ -86,4 +99,95 @@ func TestCassandraFactory(t *testing.T) {
 
 	_, err = f.CreateArchiveSpanWriter()
 	assert.NoError(t, err)
+}
+
+func TestExclusiveWhitelistBlacklist(t *testing.T) {
+	logger, logBuf := testutils.NewLogger()
+	f := NewFactory()
+	v, command := config.Viperize(f.AddFlags)
+	command.ParseFlags([]string{"--cassandra-archive.enabled=true",
+		"--cassandra.enable-dependencies-v2=true",
+		"--cassandra.index.tag-whitelist=a,b,c",
+		"--cassandra.index.tag-blacklist=a,b,c"})
+	f.InitFromViper(v)
+
+	// after InitFromViper, f.primaryConfig points to a real session builder that will fail in unit tests,
+	// so we override it with a mock.
+	f.primaryConfig = newMockSessionBuilder(nil, errors.New("made-up error"))
+	assert.EqualError(t, f.Initialize(metrics.NullFactory, zap.NewNop()), "made-up error")
+
+	var (
+		session = &mocks.Session{}
+		query   = &mocks.Query{}
+	)
+	session.On("Query", mock.AnythingOfType("string"), mock.Anything).Return(query)
+	query.On("Exec").Return(nil)
+	f.primaryConfig = newMockSessionBuilder(session, nil)
+	f.archiveConfig = newMockSessionBuilder(nil, errors.New("made-up error"))
+	assert.EqualError(t, f.Initialize(metrics.NullFactory, zap.NewNop()), "made-up error")
+
+	f.archiveConfig = nil
+	assert.NoError(t, f.Initialize(metrics.NullFactory, logger))
+	assert.Contains(t, logBuf.String(), "Cassandra archive storage configuration is empty, skipping")
+
+	_, err := f.CreateSpanWriter()
+	assert.EqualError(t, err, "only one of TagIndexBlacklist and TagIndexWhitelist can be specified")
+
+	f.archiveConfig = &mockSessionBuilder{}
+	assert.NoError(t, f.Initialize(metrics.NullFactory, zap.NewNop()))
+
+	_, err = f.CreateArchiveSpanWriter()
+	assert.EqualError(t, err, "only one of TagIndexBlacklist and TagIndexWhitelist can be specified")
+}
+
+func TestWriterOptions(t *testing.T) {
+	opts := NewOptions("cassandra")
+	v, command := config.Viperize(opts.AddFlags)
+	command.ParseFlags([]string{"--cassandra.index.tag-whitelist=a,b,c"})
+	opts.InitFromViper(v)
+
+	options, _ := writerOptions(opts)
+	assert.Len(t, options, 1)
+
+	opts = NewOptions("cassandra")
+	v, command = config.Viperize(opts.AddFlags)
+	command.ParseFlags([]string{"--cassandra.index.tag-blacklist=a,b,c"})
+	opts.InitFromViper(v)
+
+	options, _ = writerOptions(opts)
+	assert.Len(t, options, 1)
+
+	opts = NewOptions("cassandra")
+	v, command = config.Viperize(opts.AddFlags)
+	command.ParseFlags([]string{"--cassandra.index.tags=false"})
+	opts.InitFromViper(v)
+
+	options, _ = writerOptions(opts)
+	assert.Len(t, options, 1)
+
+	opts = NewOptions("cassandra")
+	v, command = config.Viperize(opts.AddFlags)
+	command.ParseFlags([]string{"--cassandra.index.tags=false", "--cassandra.index.tag-blacklist=a,b,c"})
+	opts.InitFromViper(v)
+
+	options, _ = writerOptions(opts)
+	assert.Len(t, options, 1)
+
+	opts = NewOptions("cassandra")
+	v, command = config.Viperize(opts.AddFlags)
+	command.ParseFlags([]string{""})
+	opts.InitFromViper(v)
+
+	options, _ = writerOptions(opts)
+	assert.Len(t, options, 0)
+}
+
+func TestInitFromOptions(t *testing.T) {
+	f := NewFactory()
+	o := NewOptions("foo", archiveStorageConfig)
+	o.others[archiveStorageConfig].Enabled = true
+	f.InitFromOptions(o)
+	assert.Equal(t, o, f.Options)
+	assert.Equal(t, o.GetPrimary(), f.primaryConfig)
+	assert.Equal(t, o.Get(archiveStorageConfig), f.archiveConfig)
 }

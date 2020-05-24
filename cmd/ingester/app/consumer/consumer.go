@@ -16,6 +16,7 @@ package consumer
 
 import (
 	"sync"
+	"time"
 
 	"github.com/Shopify/sarama"
 	sc "github.com/bsm/sarama-cluster"
@@ -28,10 +29,11 @@ import (
 
 // Params are the parameters of a Consumer
 type Params struct {
-	ProcessorFactory ProcessorFactory
-	Factory          metrics.Factory
-	Logger           *zap.Logger
-	InternalConsumer consumer.Consumer
+	ProcessorFactory      ProcessorFactory
+	MetricsFactory        metrics.Factory
+	Logger                *zap.Logger
+	InternalConsumer      consumer.Consumer
+	DeadlockCheckInterval time.Duration
 }
 
 // Consumer uses sarama to consume and handle messages from kafka
@@ -42,7 +44,12 @@ type Consumer struct {
 	internalConsumer consumer.Consumer
 	processorFactory ProcessorFactory
 
-	partitionIDToState map[int32]*consumerState
+	deadlockDetector deadlockDetector
+
+	partitionIDToState  map[int32]*consumerState
+	partitionMapLock    sync.Mutex
+	partitionsHeld      int64
+	partitionsHeldGauge metrics.Gauge
 }
 
 type consumerState struct {
@@ -52,20 +59,25 @@ type consumerState struct {
 
 // New is a constructor for a Consumer
 func New(params Params) (*Consumer, error) {
+	deadlockDetector := newDeadlockDetector(params.MetricsFactory, params.Logger, params.DeadlockCheckInterval)
 	return &Consumer{
-		metricsFactory:     params.Factory,
-		logger:             params.Logger,
-		internalConsumer:   params.InternalConsumer,
-		processorFactory:   params.ProcessorFactory,
-		partitionIDToState: make(map[int32]*consumerState),
+		metricsFactory:      params.MetricsFactory,
+		logger:              params.Logger,
+		internalConsumer:    params.InternalConsumer,
+		processorFactory:    params.ProcessorFactory,
+		deadlockDetector:    deadlockDetector,
+		partitionIDToState:  make(map[int32]*consumerState),
+		partitionsHeldGauge: partitionsHeldGauge(params.MetricsFactory),
 	}, nil
 }
 
 // Start begins consuming messages in a go routine
 func (c *Consumer) Start() {
+	c.deadlockDetector.start()
 	go func() {
 		c.logger.Info("Starting main loop")
 		for pc := range c.internalConsumer.Partitions() {
+			c.partitionMapLock.Lock()
 			if p, ok := c.partitionIDToState[pc.Partition()]; ok {
 				// This is a guard against simultaneously draining messages
 				// from the last time the partition was assigned and
@@ -74,6 +86,9 @@ func (c *Consumer) Start() {
 				p.wg.Wait()
 			}
 			c.partitionIDToState[pc.Partition()] = &consumerState{partitionConsumer: pc}
+			c.partitionIDToState[pc.Partition()].wg.Add(2)
+			c.partitionMapLock.Unlock()
+			c.partitionMetrics(pc.Partition()).startCounter.Inc(1)
 			go c.handleMessages(pc)
 			go c.handleErrors(pc.Partition(), pc.Errors())
 		}
@@ -82,49 +97,80 @@ func (c *Consumer) Start() {
 
 // Close closes the Consumer and underlying sarama consumer
 func (c *Consumer) Close() error {
+	c.partitionMapLock.Lock()
 	for _, p := range c.partitionIDToState {
 		c.closePartition(p.partitionConsumer)
 		p.wg.Wait()
 	}
+	c.partitionMapLock.Unlock()
+	c.deadlockDetector.close()
 	c.logger.Info("Closing parent consumer")
 	return c.internalConsumer.Close()
 }
 
 func (c *Consumer) handleMessages(pc sc.PartitionConsumer) {
 	c.logger.Info("Starting message handler", zap.Int32("partition", pc.Partition()))
-	c.partitionIDToState[pc.Partition()].wg.Add(1)
-	defer c.partitionIDToState[pc.Partition()].wg.Done()
-	defer c.closePartition(pc)
+	c.partitionMapLock.Lock()
+	c.partitionsHeld++
+	c.partitionsHeldGauge.Update(c.partitionsHeld)
+	wg := &c.partitionIDToState[pc.Partition()].wg
+	c.partitionMapLock.Unlock()
+	defer func() {
+		c.closePartition(pc)
+		wg.Done()
+		c.partitionMapLock.Lock()
+		c.partitionsHeld--
+		c.partitionsHeldGauge.Update(c.partitionsHeld)
+		c.partitionMapLock.Unlock()
+	}()
 
 	msgMetrics := c.newMsgMetrics(pc.Partition())
+
 	var msgProcessor processor.SpanProcessor
 
-	for msg := range pc.Messages() {
-		c.logger.Debug("Got msg", zap.Any("msg", msg))
-		msgMetrics.counter.Inc(1)
-		msgMetrics.offsetGauge.Update(msg.Offset)
-		msgMetrics.lagGauge.Update(pc.HighWaterMarkOffset() - msg.Offset - 1)
+	deadlockDetector := c.deadlockDetector.startMonitoringForPartition(pc.Partition())
+	defer deadlockDetector.close()
 
-		if msgProcessor == nil {
-			msgProcessor = c.processorFactory.new(pc.Partition(), msg.Offset-1)
-			defer msgProcessor.Close()
+	for {
+		select {
+		case msg, ok := <-pc.Messages():
+			if !ok {
+				c.logger.Info("Message channel closed. ", zap.Int32("partition", pc.Partition()))
+				return
+			}
+			c.logger.Debug("Got msg", zap.Any("msg", msg))
+			msgMetrics.counter.Inc(1)
+			msgMetrics.offsetGauge.Update(msg.Offset)
+			msgMetrics.lagGauge.Update(pc.HighWaterMarkOffset() - msg.Offset - 1)
+			deadlockDetector.incrementMsgCount()
+
+			if msgProcessor == nil {
+				msgProcessor = c.processorFactory.new(pc.Partition(), msg.Offset-1)
+				defer msgProcessor.Close()
+			}
+
+			msgProcessor.Process(saramaMessageWrapper{msg})
+
+		case <-deadlockDetector.closePartitionChannel():
+			c.logger.Info("Closing partition due to inactivity", zap.Int32("partition", pc.Partition()))
+			return
 		}
-
-		msgProcessor.Process(&saramaMessageWrapper{msg})
 	}
-	c.logger.Info("Finished handling messages", zap.Int32("partition", pc.Partition()))
 }
 
 func (c *Consumer) closePartition(partitionConsumer sc.PartitionConsumer) {
 	c.logger.Info("Closing partition consumer", zap.Int32("partition", partitionConsumer.Partition()))
 	partitionConsumer.Close() // blocks until messages channel is drained
+	c.partitionMetrics(partitionConsumer.Partition()).closeCounter.Inc(1)
 	c.logger.Info("Closed partition consumer", zap.Int32("partition", partitionConsumer.Partition()))
 }
 
 func (c *Consumer) handleErrors(partition int32, errChan <-chan *sarama.ConsumerError) {
 	c.logger.Info("Starting error handler", zap.Int32("partition", partition))
-	c.partitionIDToState[partition].wg.Add(1)
-	defer c.partitionIDToState[partition].wg.Done()
+	c.partitionMapLock.Lock()
+	wg := &c.partitionIDToState[partition].wg
+	c.partitionMapLock.Unlock()
+	defer wg.Done()
 
 	errMetrics := c.newErrMetrics(partition)
 	for err := range errChan {

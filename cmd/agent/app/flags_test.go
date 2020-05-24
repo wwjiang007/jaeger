@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,7 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBingFlags(t *testing.T) {
+func TestBindFlags(t *testing.T) {
 	v := viper.New()
 	b := &Builder{}
 	command := cobra.Command{}
@@ -34,8 +35,6 @@ func TestBingFlags(t *testing.T) {
 	v.BindPFlags(command.PersistentFlags())
 
 	err := command.ParseFlags([]string{
-		"--collector.host-port=1.2.3.4:555,1.2.3.4:666",
-		"--discovery.min-peers=42",
 		"--http-server.host-port=:8080",
 		"--processor.jaeger-binary.server-host-port=:1111",
 		"--processor.jaeger-binary.server-max-packet-size=4242",
@@ -46,8 +45,6 @@ func TestBingFlags(t *testing.T) {
 
 	b.InitFromViper(v)
 	assert.Equal(t, 3, len(b.Processors))
-	assert.Equal(t, []string{"1.2.3.4:555", "1.2.3.4:666"}, b.CollectorHostPorts)
-	assert.Equal(t, 42, b.DiscoveryMinPeers)
 	assert.Equal(t, ":8080", b.HTTPServer.HostPort)
 	assert.Equal(t, ":1111", b.Processors[2].Server.HostPort)
 	assert.Equal(t, 4242, b.Processors[2].Server.MaxPacketSize)

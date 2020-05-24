@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,7 +72,7 @@ func (s *queryService) GetTraces(serviceName, operation string, tags map[string]
 	}
 	defer resp.Body.Close()
 	body, _ := ioutil.ReadAll(resp.Body)
-	s.logger.Info("Retrieved trace from query", zap.String("body", string(body)), zap.String("url", url))
+	s.logger.Info("GetTraces: received response from query", zap.String("body", string(body)), zap.String("url", url))
 
 	var queryResponse response
 	if err = json.Unmarshal(body, &queryResponse); err != nil {

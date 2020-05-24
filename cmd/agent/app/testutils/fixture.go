@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,12 +19,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"github.com/uber/jaeger-lib/metrics"
+	"github.com/uber/jaeger-lib/metrics/metricstest"
 )
 
 // InitMockCollector initializes a MockTCollector fixture
-func InitMockCollector(t *testing.T) (*metrics.LocalFactory, *MockTCollector) {
-	factory := metrics.NewLocalFactory(0)
+func InitMockCollector(t *testing.T) (*metricstest.Factory, *MockTCollector) {
+	factory := metricstest.NewFactory(0)
 	collector, err := StartMockTCollector()
 	require.NoError(t, err)
 

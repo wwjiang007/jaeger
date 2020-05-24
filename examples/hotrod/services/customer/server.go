@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,13 +37,13 @@ type Server struct {
 }
 
 // NewServer creates a new customer.Server
-func NewServer(hostPort string, tracer opentracing.Tracer, metricsFactory metrics.Factory, logger log.Factory, jAgentHostPort string) *Server {
+func NewServer(hostPort string, tracer opentracing.Tracer, metricsFactory metrics.Factory, logger log.Factory) *Server {
 	return &Server{
 		hostPort: hostPort,
 		tracer:   tracer,
 		logger:   logger,
 		database: newDatabase(
-			tracing.Init("mysql", metricsFactory.Namespace("mysql", nil), logger, jAgentHostPort),
+			tracing.Init("mysql", metricsFactory, logger),
 			logger.With(zap.String("component", "mysql")),
 		),
 	}

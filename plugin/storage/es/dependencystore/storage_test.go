@@ -1,3 +1,4 @@
+// Copyright (c) 2019 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,15 +17,15 @@ package dependencystore
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/olivere/elastic"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"go.uber.org/zap"
-	"gopkg.in/olivere/elastic.v5"
 
 	"github.com/jaegertracing/jaeger/model"
 	"github.com/jaegertracing/jaeger/pkg/es/mocks"
@@ -39,14 +40,14 @@ type depStorageTest struct {
 	storage   *DependencyStore
 }
 
-func withDepStorage(fn func(r *depStorageTest)) {
+func withDepStorage(indexPrefix string, fn func(r *depStorageTest)) {
 	client := &mocks.Client{}
 	logger, logBuffer := testutils.NewLogger()
 	r := &depStorageTest{
 		client:    client,
 		logger:    logger,
 		logBuffer: logBuffer,
-		storage:   NewDependencyStore(client, logger, ""),
+		storage:   NewDependencyStore(client, logger, indexPrefix),
 	}
 	fn(r)
 }
@@ -60,13 +61,13 @@ func TestNewSpanReaderIndexPrefix(t *testing.T) {
 		expected string
 	}{
 		{prefix: "", expected: ""},
-		{prefix: "foo", expected: "foo:"},
-		{prefix: ":", expected: "::"},
+		{prefix: "foo", expected: "foo-"},
+		{prefix: ":", expected: ":-"},
 	}
 	for _, testCase := range testCases {
 		client := &mocks.Client{}
 		r := NewDependencyStore(client, zap.NewNop(), testCase.prefix)
-		assert.Equal(t, testCase.expected+dependencyIndex, r.dependencyIndexPrefix)
+		assert.Equal(t, testCase.expected+dependencyIndex, r.indexPrefix)
 	}
 }
 
@@ -75,24 +76,35 @@ func TestWriteDependencies(t *testing.T) {
 		createIndexError error
 		writeError       error
 		expectedError    string
+		esVersion        uint
 	}{
 		{
 			createIndexError: errors.New("index not created"),
-			expectedError:    "Failed to create index: index not created",
+			expectedError:    "failed to create index: index not created",
+			esVersion:        6,
 		},
-		{},
+		{
+			createIndexError: errors.New("index not created"),
+			expectedError:    "failed to create index: index not created",
+			esVersion:        7,
+		},
 	}
 	for _, testCase := range testCases {
-		withDepStorage(func(r *depStorageTest) {
+		withDepStorage("", func(r *depStorageTest) {
 			fixedTime := time.Date(1995, time.April, 21, 4, 21, 19, 95, time.UTC)
 			indexName := indexWithDate("", fixedTime)
 
 			indexService := &mocks.IndicesCreateService{}
 			writeService := &mocks.IndexService{}
 			r.client.On("Index").Return(writeService)
+			r.client.On("GetVersion").Return(testCase.esVersion)
 			r.client.On("CreateIndex", stringMatcher(indexName)).Return(indexService)
 
-			indexService.On("Body", stringMatcher(dependenciesMapping)).Return(indexService)
+			if testCase.esVersion == 7 {
+				indexService.On("Body", stringMatcher(dependenciesMapping7)).Return(indexService)
+			} else {
+				indexService.On("Body", stringMatcher(dependenciesMapping)).Return(indexService)
+			}
 			indexService.On("Do", mock.Anything).Return(nil, testCase.createIndexError)
 
 			writeService.On("Index", stringMatcher(indexName)).Return(writeService)
@@ -129,6 +141,8 @@ func TestGetDependencies(t *testing.T) {
 		searchError    error
 		expectedError  string
 		expectedOutput []model.DependencyLink
+		indexPrefix    string
+		indices        []interface{}
 	}{
 		{
 			searchResult: createSearchResult(goodDependencies),
@@ -139,25 +153,32 @@ func TestGetDependencies(t *testing.T) {
 					CallCount: 12,
 				},
 			},
+			indices: []interface{}{"jaeger-dependencies-1995-04-21", "jaeger-dependencies-1995-04-20"},
 		},
 		{
 			searchResult:  createSearchResult(badDependencies),
-			expectedError: "Unmarshalling ElasticSearch documents failed",
+			expectedError: "unmarshalling ElasticSearch documents failed",
+			indices:       []interface{}{"jaeger-dependencies-1995-04-21", "jaeger-dependencies-1995-04-20"},
 		},
 		{
 			searchError:   errors.New("search failure"),
-			expectedError: "Failed to search for dependencies: search failure",
+			expectedError: "failed to search for dependencies: search failure",
+			indices:       []interface{}{"jaeger-dependencies-1995-04-21", "jaeger-dependencies-1995-04-20"},
+		},
+		{
+			searchError:   errors.New("search failure"),
+			expectedError: "failed to search for dependencies: search failure",
+			indexPrefix:   "foo",
+			indices:       []interface{}{"foo-jaeger-dependencies-1995-04-21", "foo-jaeger-dependencies-1995-04-20"},
 		},
 	}
 	for _, testCase := range testCases {
-		withDepStorage(func(r *depStorageTest) {
+		withDepStorage(testCase.indexPrefix, func(r *depStorageTest) {
 			fixedTime := time.Date(1995, time.April, 21, 4, 21, 19, 95, time.UTC)
-			indices := []string{"jaeger-dependencies-1995-04-21", "jaeger-dependencies-1995-04-20"}
 
 			searchService := &mocks.SearchService{}
-			r.client.On("Search", indices[0], indices[1]).Return(searchService)
+			r.client.On("Search", testCase.indices...).Return(searchService)
 
-			searchService.On("Type", stringMatcher(dependencyType)).Return(searchService)
 			searchService.On("Size", mock.Anything).Return(searchService)
 			searchService.On("Query", mock.Anything).Return(searchService)
 			searchService.On("IgnoreUnavailable", mock.AnythingOfType("bool")).Return(searchService)
